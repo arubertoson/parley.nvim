@@ -1,0 +1,9 @@
+{
+  "name": "parley.nvim",
+  "private": true,
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./pi/extension.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "scripts": { "test": "node --test tests/*.test.ts" }
+}
