@@ -131,7 +131,8 @@ T["Git cross-file visits, old-side notes and exit preserve source and mappings"]
         displayed[#displayed + 1] = text
         local column = text:find("Hunk note", 1, true)
         if column then
-            note_row, note_column = row, left + column
+            note_row = row
+            note_column = left + vim.fn.strdisplaywidth(text:sub(1, column - 1)) + 1
         end
     end
     MiniTest.expect.equality(note_row ~= nil, true)
@@ -141,12 +142,14 @@ T["Git cross-file visits, old-side notes and exit preserve source and mappings"]
     end
     local source_column = child.lua_get("vim.fn.screenpos(original_win, 4, 9).col")
     MiniTest.expect.equality(note_column, source_column + 4) -- Eight spaces in code, twelve in notes.
-    -- A blank top margin and a subtle, uniform area span the window, including the gutter.
+    -- The blank margin has a role bar; background includes three padding columns.
     MiniTest.expect.equality(
         table.concat(screen.text[first + 1], "", left + 1, left + width),
-        string.rep(" ", width)
+        string.rep(" ", note_column - left - 4)
+            .. "▎"
+            .. string.rep(" ", width - (note_column - left - 3))
     )
-    for _, column in ipairs({ left + 1, left + width }) do
+    for _, column in ipairs({ note_column + 102, note_column + 103 }) do
         MiniTest.expect.equality(
             child.lua_get(
                 ("vim.fn.screenattr(%d, %d) == vim.fn.screenattr(%d, %d)"):format(
@@ -156,7 +159,7 @@ T["Git cross-file visits, old-side notes and exit preserve source and mappings"]
                     note_column
                 )
             ),
-            true
+            column == note_column + 102
         )
     end
     local style =

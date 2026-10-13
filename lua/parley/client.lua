@@ -26,7 +26,8 @@ end
 
 function M.id()
     serial = serial + 1
-    return ("nvim-%d-%s-%d"):format(uv.os_getpid(), tostring(uv.hrtime()), serial)
+    -- Fixed decimal avoids scientific-notation punctuation rejected by protocol identifiers.
+    return ("nvim-%d-%.0f-%d"):format(uv.os_getpid(), uv.hrtime(), serial)
 end
 
 function M.connect(socket, callback)
@@ -76,6 +77,10 @@ function M.connect(socket, callback)
         end)
     end
     pipe:connect(socket, function(err)
+        if client.closed then
+            vim.schedule(function() callback(nil, "Pi connection cancelled") end)
+            return
+        end
         if err then
             client.close()
             vim.schedule(function() callback(nil, "Cannot connect to Pi: " .. err) end)

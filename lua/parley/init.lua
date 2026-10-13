@@ -5,6 +5,8 @@
 local M = {}
 
 function M.start() require("parley.connected").start() end
+function M.open_offer() require("parley.connected").open_offer() end
+function M.dismiss_offer() require("parley.connected").dismiss_offer() end
 
 function M.stop()
     local connected = package.loaded["parley.connected"]
@@ -33,8 +35,14 @@ function M.help() require("parley.review").help() end
 
 function M.submit() require("parley.connected").submit() end
 function M.save() require("parley.connected").save() end
+function M.scope() require("parley.connected").scope() end
 function M.close() require("parley.connected").close() end
 function M.reply() require("parley.review").reply() end
+function M.conclude() require("parley.review").conclude() end
+function M.reopen() require("parley.review").reopen() end
+function M.collect() require("parley.connected").collect() end
+function M.finish() require("parley.connected").finish() end
+function M.conclusions() require("parley.connected").conclusions() end
 
 ---Return cached progress only; never load review, scan files or create resources.
 ---@return string Empty while review is inactive.

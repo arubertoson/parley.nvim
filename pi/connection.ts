@@ -4,12 +4,18 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { ReviewStore, atomicJson, workspaceKey, validateRequest } from "./state.ts";
+import { ReviewStore, atomicJson, workspaceKey, validateRequest, type SessionOrigin, type Review } from "./state.ts";
+
+type EditorPeer = { id: string; label: string; eligible: boolean };
+type ReadyOffer = { offerId: string; reviewId: string; scope: string; editorId?: string; dismissed?: boolean; opened?: boolean };
 
 export class Connection {
   readonly store: ReviewStore;
   private server?: net.Server;
   private sockets = new Set<net.Socket>();
+  private editors = new Map<net.Socket, EditorPeer>();
+  // Offers are presentation state, not review state. Reopening never recaptures evidence.
+  private offers = new Map<string, ReadyOffer>();
   private tail: Promise<unknown> = Promise.resolve();
   private runtime?: string;
   private lease: string;
@@ -18,7 +24,9 @@ export class Connection {
   private stopping = false;
   private closing?: Promise<void>;
   onFailure: (error: Error) => Promise<void> = async () => {};
-  onSubmit: () => void = () => {};
+  onSubmit: (reviewId: string) => void = () => {};
+  onFinish: (reviewId: string, collectionId: string, handoffId: string) => void = () => {};
+  origin: () => SessionOrigin | undefined = () => undefined;
   readonly directory: string;
   readonly root: string;
   constructor(directory: string, root: string) {
@@ -31,7 +39,7 @@ export class Connection {
     this.tail = result.catch(() => {}); // Each caller receives its failure; the queue remains usable.
     return result;
   }
-  async start() {
+  async start(preserveQueued = false) {
     await fs.mkdir(path.dirname(this.lease), { recursive: true, mode: 0o700 });
     // All lease contenders use the same exclusive acquisition guard. A crash
     // during acquisition fails closed instead of risking removal of a new owner.
@@ -64,7 +72,8 @@ export class Connection {
       if (!this.ownsLease) throw new Error("Could not acquire Parley workspace");
     } finally { await guard.close(); await fs.unlink(guardPath); }
     try {
-      await this.store.recover();
+      await this.store.recover(preserveQueued);
+      for (const item of await this.store.list()) this.offer(await this.store.read(item.id));
       this.runtime = await fs.mkdtemp(path.join(os.tmpdir(), "parley-"));
       await fs.chmod(this.runtime, 0o700);
       const socket = path.join(this.runtime, "pi.sock");
@@ -79,10 +88,52 @@ export class Connection {
       await atomicJson(this.lease, { version: 1, workspace: this.root, socket, pid: process.pid, instanceId: this.instanceId });
     } catch (error) { await this.stop(); throw error; }
   }
+  // Explicit Pi closure uses the same versioned mutation as Neovim; never deletes evidence.
+  closeReview(id: string): Promise<Review> {
+    return this.serial(async () => {
+      if (this.stopping) throw new Error("Pi is shutting down; retry closing after reconnecting");
+      let review = await this.store.read(id);
+      if (review.status === "open") review = await this.store.handle({
+        version: 1, requestId: randomUUID(), action: "close", reviewId: id,
+        payload: { expectedVersion: review.version },
+      }) as Review;
+      this.offers.delete(id);
+      return review;
+    });
+  }
+
+  offer(review: Review, again = false) {
+    const initial = review.turns.findLast(t => t.kind === "initial");
+    const ready = review.stages?.length
+      ? review.turns.some(t => t.kind === "initial" && t.status === "complete")
+      : !initial || initial.status === "complete";
+    if (review.status !== "open" || !ready) return;
+    if (again || !this.offers.has(review.id)) this.offers.set(review.id, { offerId: randomUUID(), reviewId: review.id, scope: review.scope });
+  }
+  editorChoices(): EditorPeer[] {
+    return [...new Map([...this.editors.values()].filter(e => e.eligible).map(e => [e.id, e])).values()];
+  }
+  nextOffer(): ReadyOffer | undefined {
+    return [...this.offers.values()].find(o => !o.editorId && !o.dismissed);
+  }
+  assignOffer(offer: ReadyOffer, editorId?: string) {
+    if (this.stopping || this.offers.get(offer.reviewId) !== offer) return;
+    if (editorId && this.editorChoices().some(e => e.id === editorId)) offer.editorId = editorId;
+    else if (!editorId) offer.dismissed = true; // Cancel the presentation, never the review.
+  }
+
   private accept(client: net.Socket) {
     this.sockets.add(client); client.setEncoding("utf8");
     client.setTimeout(30_000, () => client.destroy());
-    client.on("error", () => client.destroy()); client.on("close", () => this.sockets.delete(client));
+    client.on("error", () => client.destroy()); client.on("close", () => {
+      const editor = this.editors.get(client);
+      this.sockets.delete(client); this.editors.delete(client);
+      if (editor && ![...this.editors.values()].some(e => e.id === editor.id)) {
+        for (const offer of this.offers.values()) {
+          if (offer.editorId === editor.id && !offer.opened && !offer.dismissed) delete offer.editorId;
+        }
+      }
+    });
     let buffer = "", pending = 0;
     const reply = (data: unknown) => { if (!client.destroyed) client.write(JSON.stringify(data) + "\n"); };
     client.on("data", (chunk: string) => {
@@ -99,9 +150,29 @@ export class Connection {
             const request: unknown = JSON.parse(line);
             if (request && typeof request === "object" && typeof (request as {requestId?: unknown}).requestId === "string") requestId = (request as {requestId: string}).requestId;
             validateRequest(request);
-            const result = await this.store.handle(request);
+            let result: unknown;
+            if (request.action === "watch") {
+              if (request.workspace !== this.root) throw new Error("Editor workspace changed");
+              const p = request.payload!;
+              const editor = { id: p.editorId!, label: p.editorLabel!.replace(/[\x00-\x1f\x7f]/g, " "), eligible: p.eligible! };
+              this.editors.set(client, editor);
+              result = [...this.offers.values()].filter(o => o.editorId === editor.id && !o.dismissed);
+            } else if (request.action === "open-offer" || request.action === "dismiss-offer") {
+              const editor = this.editors.get(client), offer = this.offers.get(request.reviewId!);
+              if (!editor || !offer || offer.editorId !== editor.id || offer.offerId !== request.payload!.offerId) throw new Error("Offer is not assigned to this editor; use ReviewStart to reopen manually");
+              if (request.action === "dismiss-offer") { offer.dismissed = true; result = {}; }
+              else {
+                if (!editor.eligible || offer.dismissed) throw new Error("Editor is no longer eligible for this offer");
+                result = await this.store.read(offer.reviewId);
+                if ((result as Review).status !== "open") throw new Error("Review is no longer open");
+                offer.opened = true;
+              }
+            } else result = await this.store.handle(request, request.action === "finish" ? this.origin() : undefined);
             reply({ version: 1, requestId, ok: true, result });
-            if (request.action === "submit") this.onSubmit();
+            if (request.action === "close") this.offers.delete(request.reviewId!);
+            if (request.action === "submit" || request.action === "draft-conclusion") this.onSubmit(request.reviewId!);
+            // Dispatch outside the serial transaction: session shutdown must be able to drain it.
+            if (request.action === "finish") setImmediate(() => this.onFinish(request.reviewId!, request.payload!.collectionId!, request.payload!.handoffId!));
           } catch (error) { reply({ version: 1, requestId, ok: false, error: error instanceof Error ? error.message : String(error) }); }
           finally { pending--; }
         });

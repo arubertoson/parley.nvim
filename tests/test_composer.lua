@@ -83,8 +83,11 @@ local function assert_reserved(first, last)
     MiniTest.expect.equality(displayed(last) < row, true)
     MiniTest.expect.equality(displayed(last + 1), row + config.height + 1)
     local screen = child.get_screenshot()
+    local left = child.lua_get("vim.fn.win_screenpos(source_win)[2]")
+    local width = child.lua_get("vim.api.nvim_win_get_width(source_win)")
     for index = row, row + config.height do
-        MiniTest.expect.equality(table.concat(screen.text[index]):find("SOURCE-", 1, true), nil)
+        local text = table.concat(screen.text[index], "", left, left + width - 1)
+        MiniTest.expect.equality(text:find("SOURCE-", 1, true), nil)
     end
     MiniTest.expect.equality(first <= last, true)
 end
@@ -282,8 +285,7 @@ T["reservation stays out of another window displaying the same buffer"] = functi
         before.view = vim.fn.winsaveview()
         composer.open(8,8,'hunk')]])
     settle()
-    local config = composer_config()
-    MiniTest.expect.equality(displayed(9) - displayed(8), config.height + 4)
+    assert_reserved(8, 8) -- Metadata may wrap in a narrow split; measure actual room.
     MiniTest.expect.equality(displayed(9, "other_win") - displayed(8, "other_win"), 1)
     child.type_keys("Hunk note", "<Esc>", "<CR>")
     MiniTest.expect.equality(child.lua_get("composer.comments[1].target.scope"), "hunk")

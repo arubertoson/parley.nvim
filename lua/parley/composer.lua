@@ -6,6 +6,8 @@
 local M = {}
 ---@type ParleyReviewComposer.Draft[] Saved in-memory notes; mutated only by composer actions.
 M.comments = {}
+---Read-only agent findings live separately from human notes and never enter saves.
+M.findings = {}
 local api = vim.api
 local style = require("parley.style")
 local mode_help = require("parley.help")
@@ -32,6 +34,12 @@ local display_options = {
 ---@field piece integer Index into that session's frozen navigation queue.
 ---@field path string Repository-relative path.
 ---@field side 'old'|'new'
+---@field source_id string? Explicit immutable supplemental evidence identity.
+
+---@class ParleyReviewComposer.Anchor
+---@field first integer Immutable frozen-source coordinate, never editor placement.
+---@field last integer
+---@field context string[]
 
 ---@alias ParleyReviewVirtualLine string[][] Dense { text, highlight } chunks.
 
@@ -42,6 +50,8 @@ local display_options = {
 ---@field scope 'line'|'range'|'hunk'
 ---@field context string[]
 ---@field review ParleyReviewComposer.Owner? Absent for standalone composition.
+---@field anchor ParleyReviewComposer.Anchor? Durable coordinates; other fields describe editor placement.
+---@field outdated boolean? No conservative placement in the current workspace buffer.
 
 ---@class ParleyReviewComposer.Draft
 ---@field id integer
@@ -52,6 +62,7 @@ local display_options = {
 ---@field remote_id string? Stable durable note identity, assigned by the connection owner.
 ---@field reply_to string? Explicit durable note/reply parent.
 ---@field replies { id: string, replyTo: string, text: string }[]? Acknowledged agent replies.
+---@field author 'agent'? Explicit origin for immutable initial findings.
 
 ---@class ParleyReviewComposer.Item
 ---@field note ParleyReviewComposer.Draft
@@ -59,8 +70,10 @@ local display_options = {
 
 ---@class ParleyReviewComposer.Presentation
 ---@field namespace integer
----@field reserve fun(target: ParleyReviewComposer.Target, lines: ParleyReviewVirtualLine[])
+---@field reserve fun(target: ParleyReviewComposer.Target, lines: ParleyReviewVirtualLine[], draft: ParleyReviewComposer.Draft): integer? Display rows before the editor room.
 ---@field release fun()
+---@field select fun(items: string[], options: table, done: fun(choice: string?))? Review-owned focus borrowing.
+---@field concluded fun(id: string)? Select a conclusion after an explicit acknowledged save.
 
 ---@class ParleyReviewComposer.Session
 ---@field draft ParleyReviewComposer.Draft
@@ -180,9 +193,14 @@ function M.review_items(id)
             items[#items + 1] = item
         end
     end
+    for _, note in ipairs(M.findings) do
+        if note.target.review.session == id then
+            items[#items + 1] = { note = note, state = "saved" }
+        end
+    end
     for _, draft in ipairs(drafts) do
         local owner = draft.target.review
-        if owner and owner.session == id and not draft.comment then
+        if owner and owner.session == id and not draft.comment and not draft.auxiliary_key then
             items[#items + 1] = { note = draft, state = "draft" }
         end
     end
@@ -240,7 +258,11 @@ function M.close(restore)
     -- autocommands, which may redraw the screen (e.g. statusline refreshes).
     api.nvim_exec_autocmds("User", {
         pattern = "ParleyReviewNotesChanged",
-        data = { note = (s.draft.comment or s.draft).id, target = s.draft.target },
+        data = {
+            note = (s.draft.comment or s.draft).id,
+            target = s.draft.target,
+            auxiliary = s.draft.auxiliary_key ~= nil,
+        },
     })
     if api.nvim_win_is_valid(s.win) and api.nvim_win_get_buf(s.win) == s.buf then
         api.nvim_win_close(s.win, true)
@@ -334,34 +356,36 @@ local function geometry(s, reveal)
     local height = api.nvim_win_get_height(s.source_win) - winbar_rows
     local width = api.nvim_win_get_width(s.source_win)
     if height < 8 or width < 24 then return nil end
-    local indent = style.indent(s.source_win, target.first)
-    local content_width = width - indent
-    local heading =
-        style.wrap(style.label(target) .. " · editing · " .. history_label(s), content_width)
+    local indent, content_width, padding = style.layout(s.source_win, target.first)
+    local label = s.draft.label or style.label(target)
+    local heading = style.wrap(label .. " · editing · " .. history_label(s), content_width)
     local max_content_height = height - #heading - 4
     if max_content_height < 1 then return nil end
-    local content_rows = 0
-    for _, line in ipairs(api.nvim_buf_get_lines(s.buf, 0, -1, false)) do
-        content_rows = content_rows
-            + math.max(1, math.ceil((vim.fn.strdisplaywidth(line) + 1) / content_width))
-    end
+    -- Let Neovim measure its word wrapping; character-width estimates undercount it.
+    api.nvim_win_set_config(s.win, { width = content_width })
+    local content_rows = api.nvim_win_text_height(s.win, {
+        start_row = 0,
+        end_row = api.nvim_buf_line_count(s.buf) - 1,
+        max_height = 7,
+    }).all
     local content_height = math.min(math.max(1, content_rows), 6, max_content_height)
     s.rows = content_height + #heading + 2 -- Top margin, metadata, editor, bottom margin.
     local blanks = {}
     for _ = 1, s.rows do
-        blanks[#blanks + 1] = { { string.rep(" ", width), "ParleyReviewNote" } }
+        blanks[#blanks + 1] = style.card_line(indent, content_width, padding, {}, false)
     end
     for i, text in ipairs(heading) do
-        blanks[i + 1] = {
-            { string.rep(" ", indent), "ParleyReviewNote" },
-            {
-                text .. string.rep(" ", math.max(0, content_width - vim.fn.strdisplaywidth(text))),
-                "ParleyReviewNoteHeading",
-            },
-        }
+        blanks[i + 1] = style.card_line(
+            indent,
+            content_width,
+            padding,
+            { { text, "ParleyReviewNoteHeading" } },
+            false
+        )
     end
+    local preceding = 0
     if s.presentation then
-        s.presentation.reserve(target, blanks)
+        preceding = s.presentation.reserve(target, blanks, s.draft) or 0
     else
         api.nvim_buf_set_extmark(s.source_buf, ns, target.last - 1, 0, {
             id = s.mark,
@@ -390,8 +414,8 @@ local function geometry(s, reveal)
                 start_vcol = view.skipcol,
                 end_row = target.last - 1,
                 max_height = height + 1,
-            }).all + view.topfill
-            -- Keep room for at least one source display row below, except at EOF.
+            }).all + view.topfill + preceding
+            -- Keep room for at least one display row below, except at EOF.
             local below = target.last < api.nvim_buf_line_count(s.source_buf) and 1 or 0
             if row + s.rows + below > height then return nil end
             return row
@@ -399,7 +423,7 @@ local function geometry(s, reveal)
         local row = space()
         if not row and reveal then
             api.nvim_win_set_cursor(s.source_win, { target.last, 0 })
-            vim.cmd("normal! zz")
+            vim.cmd("normal! zt")
             row = space()
         end
         if not row then return end
@@ -505,6 +529,7 @@ api.nvim_set_decoration_provider(display_ns, {
 
 local function commit()
     local s = assert(session)
+    if s.saving or s.draft.saving then return end
     if s.closing or not vim.deep_equal(s.display, display_signature(s)) then
         M.close(false)
         vim.notify("Review draft retained: source context changed", vim.log.levels.WARN)
@@ -520,6 +545,32 @@ local function commit()
             "Empty text does not delete a saved note; cancel or use confirmed deletion",
             vim.log.levels.INFO
         )
+        return
+    end
+    if s.draft.on_save then
+        s.saving = true
+        s.draft.saving = true
+        vim.bo[s.buf].modifiable = false
+        local lines = vim.deepcopy(s.draft.lines)
+        s.draft.on_save(lines, function(ok, err)
+            s.saving = false
+            s.draft.saving = false
+            if api.nvim_buf_is_valid(s.buf) then vim.bo[s.buf].modifiable = true end
+            if not ok then
+                vim.notify(
+                    "Parley conclusion draft retained: " .. tostring(err),
+                    vim.log.levels.WARN
+                )
+                return
+            end
+            remove_draft(s.draft)
+            if session == s then M.close(true) end
+            release_editor(s.draft)
+            vim.notify(
+                "Parley conclusion saved; no implementation authorized",
+                vim.log.levels.INFO
+            )
+        end)
         return
     end
     sync_undo(s.buf)
@@ -554,6 +605,10 @@ end
 ---@param draft ParleyReviewComposer.Draft
 ---@param presentation ParleyReviewComposer.Presentation?
 local function open_draft(draft, presentation)
+    if draft.saving then
+        vim.notify("Parley conclusion is awaiting acknowledgement", vim.log.levels.INFO)
+        return
+    end
     local source_win = api.nvim_get_current_win()
     local source_buf = api.nvim_get_current_buf()
     if
@@ -651,7 +706,7 @@ local function open_draft(draft, presentation)
     last_draft = draft
     vim.wo[win].wrap = true
     style.refresh()
-    vim.wo[win].linebreak = false
+    vim.wo[win].linebreak = true
     vim.wo[win].spell = true
     vim.wo[win].winhighlight =
         "Normal:ParleyReviewNoteActive,NormalFloat:ParleyReviewNoteActive,EndOfBuffer:ParleyReviewNoteActive"
@@ -772,7 +827,8 @@ end
 ---@param scope 'line'|'range'|'hunk'
 ---@param review ParleyReviewComposer.Owner? Frozen review-piece identity.
 ---@param presentation ParleyReviewComposer.Presentation? Borrowed room owned by review mode.
-function M.open(first, last, scope, review, presentation)
+---@param anchor ParleyReviewComposer.Anchor? Captured before opening; never changed by projection.
+function M.open(first, last, scope, review, presentation, anchor)
     local buf = api.nvim_get_current_buf()
     assert(
         first >= 1 and last >= first and last <= api.nvim_buf_line_count(buf),
@@ -797,6 +853,7 @@ function M.open(first, last, scope, review, presentation)
         scope = scope,
         context = api.nvim_buf_get_lines(buf, first - 1, last, false),
         review = review,
+        anchor = anchor and vim.deepcopy(anchor),
     }
     for _, draft in ipairs(drafts) do
         if vim.deep_equal(draft.target, target) then
@@ -819,8 +876,13 @@ end
 ---@param comment ParleyReviewComposer.Draft Borrowed saved note; must have no parent comment.
 ---@param presentation ParleyReviewComposer.Presentation?
 function M.edit(comment, presentation)
+    if comment.author == "agent" then
+        vim.notify("Agent finding is read-only; use reply to discuss it", vim.log.levels.INFO)
+        return
+    end
     for _, draft in ipairs(drafts) do
         if draft.comment == comment then
+            draft.target = vim.deepcopy(comment.target)
             open_draft(draft, presentation)
             return
         end
@@ -851,22 +913,36 @@ function M.restore_review(notes)
     for _, note in ipairs(notes) do
         note.id = next_id()
         note.cursor = { 1, 0 }
-        M.comments[#M.comments + 1] = note
+        local collection = note.author == "agent" and M.findings or M.comments
+        collection[#collection + 1] = note
     end
 end
 
 ---A reply is a distinct note with an explicit parent, even at an identical target.
-function M.reply(note, parent, presentation)
+---@param lines string[]? Optional copied text; owned by the new human draft, never the original agent message.
+function M.reply(note, parent, presentation, lines)
     local draft = {
         id = next_id(),
         target = vim.deepcopy(note.target),
-        lines = { "" },
+        lines = lines and vim.deepcopy(lines) or { "" },
         cursor = { 1, 0 },
         reply_to = parent,
     }
     drafts[#drafts + 1] = draft
     open_draft(draft, presentation)
 end
+
+---The composer owns this source's display while its editor is open, including
+---the focus transition into the float. Querying ownership never captures text.
+function M.owns_source_window(win)
+    return session ~= nil
+        and not session.closing
+        and session.source_win == win
+        and source_available(session)
+end
+
+---A passive lifecycle query; never reads or saves the composer text.
+function M.is_open() return session ~= nil and not session.closing end
 
 ---The active editor is an action boundary; read its current text before acting.
 ---@return ParleyReviewComposer.Item? Absent when the composer is closed.
@@ -897,7 +973,11 @@ function M.discard(item)
     else
         api.nvim_exec_autocmds("User", {
             pattern = "ParleyReviewNotesChanged",
-            data = { note = editor_id(draft), target = draft.target },
+            data = {
+                note = editor_id(draft),
+                target = draft.target,
+                auxiliary = draft.auxiliary_key ~= nil,
+            },
         })
     end
     if not draft.comment then release_editor(draft) end
@@ -908,6 +988,10 @@ end
 function M.delete(item)
     local comment = item.note.comment or (item.state == "saved" and item.note)
     assert(comment, "Discard new drafts rather than deleting a saved note")
+    if comment.author == "agent" then
+        vim.notify("Agent findings cannot be deleted", vim.log.levels.INFO)
+        return
+    end
     if session and (session.draft == item.note or session.draft.comment == comment) then
         M.close(true)
     end
@@ -922,6 +1006,48 @@ function M.delete(item)
     end
     release_editor(comment)
     api.nvim_exec_autocmds("User", { pattern = "ParleyReviewNotesChanged" })
+end
+
+---Open a retained auxiliary summary in the same reserved-space editor, never as a human note.
+---The connection owns acknowledgement; failed saves keep the draft and undo buffer.
+function M.auxiliary(key, target, lines, label, presentation, on_save)
+    for _, draft in ipairs(drafts) do
+        if draft.auxiliary_key == key then
+            draft.target = vim.deepcopy(target)
+            draft.label, draft.on_save = label, on_save
+            open_draft(draft, presentation)
+            return
+        end
+    end
+    local draft = {
+        id = next_id(),
+        target = vim.deepcopy(target),
+        lines = vim.deepcopy(lines),
+        cursor = { 1, 0 },
+        auxiliary_key = key,
+        label = label,
+        on_save = on_save,
+    }
+    drafts[#drafts + 1] = draft
+    open_draft(draft, presentation)
+end
+
+---Resume without replacing retained edits or their original save/provenance callback.
+function M.resume_auxiliary(key, presentation)
+    for _, draft in ipairs(drafts) do
+        if draft.auxiliary_key == key then
+            open_draft(draft, presentation)
+            return true
+        end
+    end
+    return false
+end
+
+function M.has_drafts(id)
+    for _, draft in ipairs(drafts) do
+        if draft.target.review and draft.target.review.session == id then return true end
+    end
+    return false
 end
 
 function M.resume()
