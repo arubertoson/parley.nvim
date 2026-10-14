@@ -1089,6 +1089,9 @@ local function connect_review(item, current, done)
     pending_client = connecting
 end
 
+---Cached guard only; activation must not replace a retained legacy attachment.
+function M.is_busy() return active ~= nil or pending_client ~= nil or watcher.opening end
+
 function M.start()
     if review.is_active() then
         notify("Already in review mode")

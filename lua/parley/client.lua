@@ -8,7 +8,7 @@ local M = {}
 ---@alias ParleyClient.Result table<string|integer, unknown>
 ---@alias ParleyClient.ResultCallback fun(result: ParleyClient.Result?, err: string?)
 ---@alias ParleyClient.ConnectCallback fun(client: ParleyClient?, err: string?)
----@alias ParleyClient.RequestHandler fun(request: ParleyClient.Request): ParleyClient.Result?, string?
+---@alias ParleyClient.RequestHandler fun(request: ParleyClient.Request, respond: ParleyClient.ResultCallback)
 
 ---Only the header is validated before dispatch. Payloads remain untrusted.
 ---@class ParleyClient.Request
@@ -80,10 +80,44 @@ function M.id()
     return ("nvim-%d-%.0f-%d"):format(uv.os_getpid(), uv.hrtime(), serial)
 end
 
+---@param request_id string
+---@param result ParleyClient.Result?
+---@param handler_err string?
+---@return string? encoded
+---@return string? err
+local function encode_response(request_id, result, handler_err)
+    ---@type ParleyClient.Response
+    local envelope
+    if result ~= nil then
+        envelope = { version = 1, requestId = request_id, ok = true, result = result }
+    else
+        envelope = {
+            version = 1,
+            requestId = request_id,
+            ok = false,
+            error = handler_err or "Unsupported Pi request",
+        }
+    end
+    local encoded, data = pcall(vim.json.encode, envelope)
+    if not encoded then
+        -- Serialization failed before delivery. Send a correlated failure, not the bad result.
+        envelope = {
+            version = 1,
+            requestId = request_id,
+            ok = false,
+            error = "Editor result encoding failed: " .. tostring(data),
+        }
+        encoded, data = pcall(vim.json.encode, envelope)
+    end
+    if not encoded then return nil, tostring(data) end
+    return data .. "\n"
+end
+
 ---Return a caller-owned client immediately, including while connecting.
 ---The scheduled callback receives it only after connection succeeds. Results
 ---and incoming requests run on the main loop; closed-request failure is immediate.
 ---Payloads are encoded at submission, not retained; callbacks live until settlement.
+---Incoming handlers respond once, synchronously or after application-owned work completes.
 ---Result tables are handed to the application and not retained by the transport.
 ---Handle-allocation failure raises; socket connection failure uses the callback.
 ---@param socket string Unix socket path from discovery.
@@ -166,6 +200,51 @@ function M.connect(socket, callback, on_request)
         end)
         return id
     end
+    local function response_written(err)
+        if err then client.close("Editor result write failed: " .. err) end
+    end
+
+    ---@param request ParleyClient.Request Header validated; payload remains untrusted.
+    ---@param handler ParleyClient.RequestHandler
+    local function handle_request(request, handler)
+        if client.closed then return end
+        local responded = false
+        local function respond(result, handler_err)
+            if responded or client.closed then return end
+            local data, encode_err = encode_response(request.requestId, result, handler_err)
+            if not data then
+                client.close(
+                    "Editor response encoding failed: "
+                        .. (encode_err or "unknown serialization error")
+                )
+                return
+            end
+            -- Once writing starts, delivery can be uncertain. Never retry this response.
+            responded = true
+            local written, write_request, write_err =
+                pcall(pipe.write, pipe, data, response_written)
+            if not written then
+                client.close("Editor result write failed: " .. tostring(write_request))
+            elseif not write_request then
+                client.close(
+                    "Editor result write failed: " .. (write_err or "write was not queued")
+                )
+            end
+        end
+        -- Protect invocation only; the handler owns failures in its later asynchronous work.
+        -- respond() protects encoding and writing regardless of when the handler calls it.
+        local handled, handler_err = pcall(handler, request, respond)
+        if not handled then
+            if responded then
+                client.close(
+                    "Editor request handler failed after responding: " .. tostring(handler_err)
+                )
+            else
+                respond(nil, tostring(handler_err))
+            end
+        end
+    end
+
     connect_timer:start(10000, 0, function() client.close("Pi socket connection timed out") end)
     pipe:connect(socket, function(err)
         if client.closed then
@@ -204,25 +283,7 @@ function M.connect(socket, callback, on_request)
                     end
                     -- Header validation above does not validate the application payload.
                     ---@cast response ParleyClient.Request
-                    vim.schedule(function()
-                        if client.closed then return end
-                        local handled, result, handler_err = pcall(on_request, response)
-                        if not handled then
-                            handler_err, result = tostring(result), nil
-                        end
-                        pipe:write(vim.json.encode({
-                            version = 1,
-                            requestId = response.requestId,
-                            ok = result ~= nil,
-                            result = result,
-                            error = handler_err
-                                or (result == nil and "Unsupported Pi request" or nil),
-                        }) .. "\n", function(write_err)
-                            if write_err then
-                                client.close("Editor result write failed: " .. write_err)
-                            end
-                        end)
-                    end)
+                    vim.schedule(function() handle_request(response, on_request) end)
                 else
                     if
                         not ok

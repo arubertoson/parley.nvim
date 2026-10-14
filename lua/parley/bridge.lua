@@ -1,8 +1,14 @@
 ---Passive workspace bridge. Plugin startup owns its timer/pipe; require acquires nothing.
 ---Binding survives disconnects and Pi reloads, but never follows a changed Pi session.
----No review, draft, presentation or agent-execution policy lives here.
+---Explicit activation is dispatched to workspace.lua; transport owns no model policy.
 local client = require("parley.client")
 local M = {}
+
+local actions = {
+    attach = "bridge-attach",
+    ping = "bridge-ping",
+    activate = "workspace-activate",
+}
 
 ---@alias ParleyBridge.State 'waiting'|'connecting'|'connected'|'unavailable'|'rebind-required'
 
@@ -23,6 +29,10 @@ local M = {}
 
 ---@class ParleyBridge.PingIdentity: ParleyBridge.Identity
 ---@field nonce string
+
+---Outbound result fields; incoming action-specific fields remain untrusted.
+---@class ParleyBridge.Result: ParleyBridge.PingIdentity
+---@field active? true
 
 ---@class ParleyBridge.Payload
 ---@field instanceId string
@@ -116,28 +126,80 @@ local function payload(endpoint)
     }
 end
 
----@param message ParleyClient.Request Header validated by the transport; payload untrusted.
----@return ParleyBridge.PingIdentity? result
----@return string? err
-local function incoming(message)
-    local endpoint = binding
-    local p = message.payload
-    if message.action ~= "bridge-ping" or not endpoint or not matches(p, endpoint) then
-        return nil, "Pi request identity does not match the attached bridge"
-    end
-    ---@cast p ParleyBridge.Identity
-    if type(p.nonce) ~= "string" or p.nonce ~= message.requestId then
-        return nil, "Pi request identity does not match the attached bridge"
-    end
-    ---@cast p ParleyBridge.PingIdentity
+---@param endpoint ParleyBridge.Endpoint
+---@param nonce string
+---@return ParleyBridge.Result
+local function response_identity(endpoint, nonce)
     return {
         version = 1,
-        workspace = root,
+        workspace = endpoint.workspace,
         editorId = editor_id,
         instanceId = endpoint.instanceId,
         sessionId = endpoint.sessionId,
-        nonce = p.nonce,
+        nonce = nonce,
     }
+end
+
+---@param p ParleyBridge.PingIdentity Verified identity and correlated nonce.
+---@param endpoint ParleyBridge.Endpoint
+---@param respond ParleyClient.ResultCallback
+local function handle_ping(p, endpoint, respond) respond(response_identity(endpoint, p.nonce)) end
+
+---@param p ParleyBridge.PingIdentity Verified identity and correlated nonce.
+---@param endpoint ParleyBridge.Endpoint
+---@param respond ParleyClient.ResultCallback
+local function handle_activate(p, endpoint, respond)
+    if stopped or not pipe or pipe.closed or status.state ~= "connected" then
+        respond(nil, "Bridge is not connected; no review activated")
+        return
+    end
+    local activated, err = require("parley.workspace").activate(endpoint)
+    if not activated then
+        respond(nil, err)
+        return
+    end
+    local result = response_identity(endpoint, p.nonce)
+    result.active = true
+    respond(result)
+end
+
+---@type table<string, fun(p: ParleyBridge.PingIdentity, endpoint: ParleyBridge.Endpoint, respond: ParleyClient.ResultCallback)>
+local handlers = {
+    [actions.ping] = handle_ping,
+    [actions.activate] = handle_activate,
+}
+
+---@param message ParleyClient.Request Header validated by the transport; payload untrusted.
+---@param respond ParleyClient.ResultCallback
+local function incoming(message, respond)
+    local endpoint = binding
+    local p = message.payload
+    if not endpoint or not matches(p, endpoint) then
+        respond(nil, "Pi request identity does not match the attached bridge")
+        return
+    end
+    ---@cast p ParleyBridge.Identity
+    if type(p.nonce) ~= "string" or p.nonce ~= message.requestId then
+        respond(nil, "Pi request identity does not match the attached bridge")
+        return
+    end
+    ---@cast p ParleyBridge.PingIdentity
+    local handler = handlers[message.action]
+    if not handler then
+        respond(nil, "Unsupported Pi presentation request")
+        return
+    end
+    handler(p, endpoint, respond)
+end
+
+---Editor-initiated activation uses the same verified binding, without another pipe.
+---@return boolean activated
+---@return string? err
+function M.activate()
+    if stopped or not pipe or pipe.closed or status.state ~= "connected" or not binding then
+        return false, "No matching connected Pi session; check :checkhealth parley"
+    end
+    return require("parley.workspace").activate(binding)
 end
 
 ---Submit a model-free request. The callback borrows the verified result also
@@ -164,7 +226,7 @@ function M.ping(done)
     p.nonce = client.id()
     ---@type string?
     local request_id
-    request_id = owner.request("bridge-ping", nil, p, function(result, err)
+    request_id = owner.request(actions.ping, nil, p, function(result, err)
         if owner ~= pipe then
             done(nil, "Bridge binding changed during request")
             return
@@ -257,7 +319,7 @@ local function tick()
             end
             local p = payload(endpoint)
             p.label = "Neovim PID " .. vim.uv.os_getpid() .. " · " .. root:sub(1, 200)
-            owner.request("bridge-attach", nil, p, function(identity, attach_err)
+            owner.request(actions.attach, nil, p, function(identity, attach_err)
                 if stopped or generation ~= token or pipe ~= owner then
                     owner.close()
                     return
