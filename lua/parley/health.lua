@@ -41,7 +41,16 @@ local function check_runtime()
         health.error("Bridge requires vim.fs path helpers and vim.json")
         available = false
     end
-    if available then health.ok("Unix-socket bridge APIs are available") end
+    if not vim.api.nvim__ns_set then
+        health.error("Composer requires Neovim's experimental nvim__ns_set API", {
+            "Use a Neovim build that provides window-scoped namespaces.",
+        })
+    else
+        health.ok("Window-scoped composer namespaces are available")
+    end
+    if available then
+        health.ok("Unix-socket bridge APIs are available")
+    end
     return available
 end
 
@@ -130,7 +139,9 @@ function M.check()
     health.info(
         "Passive report: no socket requests, review activation, session changes or model work"
     )
-    if not check_runtime() then return end
+    if not check_runtime() then
+        return
+    end
 
     local client = require("parley.client")
     -- Do not load/activate the bridge merely to report its status.
