@@ -2,25 +2,30 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { WorkspaceBridge, workspaceRoot } from "./bridge.ts";
 
 // Registration is inert. The session owns a passive bridge; /review owns activation.
-export default function parley(pi: ExtensionAPI) {
+export default function parley(pi: ExtensionAPI): void {
   let bridge: WorkspaceBridge | undefined;
   let context: ExtensionContext | undefined;
   let generation = 0;
-  let opening = false;
+  let activating = false;
   let startup: Promise<void> | undefined;
 
   pi.on("session_start", async (_event, ctx) => {
-    if (ctx.mode !== "tui") return;
-    const token = ++generation;
+    if (ctx.mode !== "tui") {
+      return;
+    }
+    const sessionGeneration = ++generation;
     context = ctx;
     const previous = bridge;
     const previousStartup = startup;
     bridge = undefined;
     startup = (async () => {
-      await previousStartup?.catch(() => {}); // Its session handler reports startup failure.
+      // The previous session handler reports its own startup failure.
+      await previousStartup?.catch(() => {});
       await previous?.stop();
       const root = await workspaceRoot(ctx.cwd);
-      if (generation !== token) return;
+      if (generation !== sessionGeneration) {
+        return;
+      }
       const owner = new WorkspaceBridge(root, ctx.sessionManager.getSessionId());
       let failed = false;
       owner.onPeersChanged = () => {
@@ -29,14 +34,16 @@ export default function parley(pi: ExtensionAPI) {
         }
       };
       owner.onFailure = error => {
-        if (bridge !== owner) return;
+        if (bridge !== owner) {
+          return;
+        }
         failed = true;
         ctx.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload");
         ctx.ui.notify(`Parley bridge: ${error.message}`, "error");
       };
       try {
         await owner.start();
-        if (generation !== token) {
+        if (generation !== sessionGeneration) {
           await owner.stop();
           return;
         }
@@ -50,7 +57,9 @@ export default function parley(pi: ExtensionAPI) {
     try {
       await startup;
     } catch (error) {
-      if (generation !== token) return;
+      if (generation !== sessionGeneration) {
+        return;
+      }
       ctx.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload in a workspace");
       ctx.ui.notify(`Parley bridge: ${String(error)}. No review activated.`, "error");
     }
@@ -60,9 +69,12 @@ export default function parley(pi: ExtensionAPI) {
     ++generation;
     const owner = bridge;
     bridge = undefined;
-    if (context?.mode === "tui") context.ui.setStatus("parley-bridge", undefined);
+    if (context?.mode === "tui") {
+      context.ui.setStatus("parley-bridge", undefined);
+    }
     context = undefined;
-    await startup?.catch(() => {}); // Startup handler reports its own failure.
+    // The startup handler reports its own failure.
+    await startup?.catch(() => {});
     await owner?.stop();
   });
 
@@ -77,42 +89,56 @@ export default function parley(pi: ExtensionAPI) {
         ctx.ui.notify("Use /review without arguments. This command only activates workspace review mode.", "error");
         return;
       }
-      if (opening || !ctx.isIdle() || ctx.hasPendingMessages()) {
+      if (activating || !ctx.isIdle() || ctx.hasPendingMessages()) {
         ctx.ui.notify("Pi is busy; no review activated.", "error");
         return;
       }
       const owner = bridge;
-      const token = generation;
+      const sessionGeneration = generation;
       const sessionId = ctx.sessionManager.getSessionId();
       if (!owner || owner.sessionId !== sessionId) {
         ctx.ui.notify("No matching workspace bridge; /reload in this workspace.", "error");
         return;
       }
-      const current = () => generation === token && bridge === owner
-        && ctx.sessionManager.getSessionId() === sessionId && ctx.isIdle() && !ctx.hasPendingMessages();
-      opening = true;
+      // Recheck ownership and availability after dialogs and transport awaits.
+      const canActivate = (): boolean => {
+        return generation === sessionGeneration
+          && bridge === owner
+          && ctx.sessionManager.getSessionId() === sessionId
+          && ctx.isIdle()
+          && !ctx.hasPendingMessages();
+      };
+      activating = true;
       try {
         const editors = owner.editorChoices();
-        if (!editors.length) throw new Error("No matching connected Neovim; check :checkhealth parley");
+        if (editors.length === 0) {
+          throw new Error("No matching connected Neovim; check :checkhealth parley");
+        }
         let editor = editors.length === 1 ? editors[0] : undefined;
         if (!editor) {
           const labels = editors.map(peer => `${peer.label} · ${peer.editorId}`);
           const selected = await ctx.ui.select("Activate review in which Neovim?", labels);
-          if (selected === undefined || !current()) return;
+          if (selected === undefined || !canActivate()) {
+            return;
+          }
           editor = editors[labels.indexOf(selected)];
-          if (!editor) throw new Error("Unknown editor selection");
+          if (!editor) {
+            throw new Error("Unknown editor selection");
+          }
         }
-        if (!current()) return;
+        if (!canActivate()) {
+          return;
+        }
         await owner.activateEditor(editor.editorId);
-        if (current()) {
+        if (canActivate()) {
           ctx.ui.notify(`Workspace review active in ${editor.label}. No capture or model work started.`, "info");
         }
       } catch (error) {
-        if (generation === token) {
+        if (generation === sessionGeneration) {
           ctx.ui.notify(`Parley: ${error instanceof Error ? error.message : String(error)}`, "error");
         }
       } finally {
-        opening = false;
+        activating = false;
       }
     },
   });
