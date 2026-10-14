@@ -41,13 +41,6 @@ local function check_runtime()
         health.error("Bridge requires vim.fs path helpers and vim.json")
         available = false
     end
-    if not vim.api.nvim__ns_set then
-        health.error("Composer requires Neovim's experimental nvim__ns_set API", {
-            "Use a Neovim build that provides window-scoped namespaces.",
-        })
-    else
-        health.ok("Window-scoped namespaces are available")
-    end
     if available then health.ok("Unix-socket bridge APIs are available") end
     return available
 end

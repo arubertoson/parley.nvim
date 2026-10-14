@@ -22,7 +22,6 @@ local function source_window(root, win)
     if not api.nvim_win_is_valid(win) then return end
     local buf = api.nvim_win_get_buf(win)
     if api.nvim_win_get_config(win).relative ~= "" or vim.bo[buf].buftype ~= "" then return end
-    if vim.b[buf].parley_snapshot then return end
     local name = vim.fs.normalize(api.nvim_buf_get_name(buf))
     local prefix = root .. "/"
     if name:sub(1, #prefix) ~= prefix then return end
@@ -58,15 +57,6 @@ function M.activate(binding)
         end
         return false,
             "Another workspace/Pi session is active; stop it explicitly before activating"
-    end
-    local review, composer = package.loaded["parley.review"], package.loaded["parley.composer"]
-    local connected = package.loaded["parley.connected"]
-    if
-        (review and review.is_active())
-        or (composer and composer.is_open())
-        or (connected and connected.is_busy())
-    then
-        return false, "An existing review or composer is active; no conversation or draft replaced"
     end
     local win = source_window(binding.workspace)
     if vim.fn.mode() ~= "n" or not win then
