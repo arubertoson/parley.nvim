@@ -37,5 +37,10 @@ for command, action in pairs({
     })
 end
 
+vim.api.nvim_create_user_command("ParleyBind", function() require("parley.bridge").bind() end, {
+    desc = "Explicitly bind the current workspace's advertised Pi session; no review activation",
+})
+
+vim.schedule(function() require("parley.bridge").start() end)
 -- Passive workspace discovery belongs to plugin activation, never require("parley").
 vim.schedule(function() require("parley.connected").watch() end)

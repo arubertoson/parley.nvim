@@ -1,14 +1,63 @@
 ---Versioned NDJSON client. Each instance owns its pipe, request timers and acknowledgements.
 ---No resources are acquired by require(); callbacks run on Neovim's main loop.
-local M = {}
 local uv = vim.uv
+local M = {}
+
+---A decoded table, not a validated application result. The request's handler
+---owns validation of its fields; the transport only validates the envelope.
+---@alias ParleyClient.Result table<string|integer, unknown>
+---@alias ParleyClient.ResultCallback fun(result: ParleyClient.Result?, err: string?)
+---@alias ParleyClient.ConnectCallback fun(client: ParleyClient?, err: string?)
+---@alias ParleyClient.RequestHandler fun(request: ParleyClient.Request): ParleyClient.Result?, string?
+
+---Only the header is validated before dispatch. Payloads remain untrusted.
+---@class ParleyClient.Request
+---@field version 1
+---@field requestId string
+---@field action string
+---@field payload? unknown
+---@field reviewId? unknown
+---@field workspace? unknown
+
+---Discovery validates workspace, protocol version and socket path only.
+---Runtime/session identity must still be checked by attach over the socket.
+---@class ParleyClient.Endpoint
+---@field version 1
+---@field workspace string
+---@field socket string
+---@field instanceId? unknown
+---@field sessionId? unknown
+---@field pid? unknown
+
+---@class ParleyClient.Success
+---@field version 1
+---@field requestId string
+---@field ok true
+---@field result ParleyClient.Result Fields remain untrusted application data.
+
+---@class ParleyClient.Failure
+---@field version 1
+---@field requestId string
+---@field ok false
+---@field error string
+
+---@alias ParleyClient.Response ParleyClient.Success|ParleyClient.Failure
+
+---@class ParleyClient.Pending
+---@field callback ParleyClient.ResultCallback
+---@field timer uv.uv_timer_t Owned until result, timeout or client closure.
+
 local serial = 0
 
+---@return string
 function M.state_directory()
     return vim.env.PARLEY_STATE_DIR
         or vim.fs.joinpath(vim.env.XDG_STATE_HOME or vim.fn.expand("~/.local/state"), "parley")
 end
 
+---@param cwd string
+---@return string? root Canonical workspace, or nil on failure.
+---@return string? err
 function M.workspace(cwd)
     local dir = uv.fs_realpath(cwd)
     if not dir then return nil, "Cannot resolve workspace" end
@@ -24,19 +73,52 @@ function M.workspace(cwd)
     end
 end
 
+---@return string
 function M.id()
     serial = serial + 1
     -- Fixed decimal avoids scientific-notation punctuation rejected by protocol identifiers.
     return ("nvim-%d-%.0f-%d"):format(uv.os_getpid(), uv.hrtime(), serial)
 end
 
-function M.connect(socket, callback)
-    local pipe = uv.new_pipe(false)
+---Return a caller-owned client immediately, including while connecting.
+---The scheduled callback receives it only after connection succeeds. Results
+---and incoming requests run on the main loop; closed-request failure is immediate.
+---Payloads are encoded at submission, not retained; callbacks live until settlement.
+---Result tables are handed to the application and not retained by the transport.
+---Handle-allocation failure raises; socket connection failure uses the callback.
+---@param socket string Unix socket path from discovery.
+---@param callback ParleyClient.ConnectCallback
+---@param on_request ParleyClient.RequestHandler? Application-owned named-request handler.
+---@return ParleyClient client Caller must close it, even when cancelling connection.
+function M.connect(socket, callback, on_request)
+    ---@type uv.uv_pipe_t
+    local pipe = assert(uv.new_pipe(false))
+    ---The caller owns closure. Pending callbacks receive at most one result/error.
+    ---@class ParleyClient
+    ---@field pending table<string, ParleyClient.Pending> Transport-owned; callers must not mutate.
+    ---@field closed boolean
+    ---@field on_disconnect fun(reason: string?)? Called on the main loop after closure.
+    ---@field close fun(reason?: string) Idempotently close pipe/timers and fail pending requests.
+    ---@field request fun(action: string, review_id: string?, payload: table<string, unknown>?, done: ParleyClient.ResultCallback, workspace?: string): string? Request ID, absent if already closed.
     local client = { pending = {}, closed = false }
     local buffer = ""
+    ---@type uv.uv_timer_t
+    local connect_timer = assert(uv.new_timer())
+    local connect_completed = false
+    ---@param owner ParleyClient?
+    ---@param err string?
+    local function complete_connect(owner, err)
+        if connect_completed then return end
+        connect_completed = true
+        connect_timer:stop()
+        connect_timer:close()
+        vim.schedule(function() callback(owner, err) end)
+    end
+    ---@param reason string?
     function client.close(reason)
         if client.closed then return end
         client.closed = true
+        complete_connect(nil, reason or "Pi connection cancelled")
         pipe:read_stop()
         if not pipe:is_closing() then pipe:close() end
         for id, entry in pairs(client.pending) do
@@ -47,13 +129,20 @@ function M.connect(socket, callback)
         end
         if client.on_disconnect then vim.schedule(function() client.on_disconnect(reason) end) end
     end
+    ---@param action string
+    ---@param review_id string?
+    ---@param payload table<string, unknown>?
+    ---@param done ParleyClient.ResultCallback
+    ---@param workspace string?
+    ---@return string? request_id Absent if the client is already closed.
     function client.request(action, review_id, payload, done, workspace)
         if client.closed then
             done(nil, "Pi connection is closed")
             return
         end
         local id = M.id()
-        local timer = uv.new_timer()
+        ---@type uv.uv_timer_t
+        local timer = assert(uv.new_timer())
         client.pending[id] = { callback = done, timer = timer }
         timer:start(
             10000,
@@ -75,15 +164,16 @@ function M.connect(socket, callback)
         pipe:write(vim.json.encode(message) .. "\n", function(err)
             if err then client.close("Pi write failed: " .. err) end
         end)
+        return id
     end
+    connect_timer:start(10000, 0, function() client.close("Pi socket connection timed out") end)
     pipe:connect(socket, function(err)
         if client.closed then
-            vim.schedule(function() callback(nil, "Pi connection cancelled") end)
+            complete_connect(nil, "Pi connection cancelled")
             return
         end
         if err then
-            client.close()
-            vim.schedule(function() callback(nil, "Cannot connect to Pi: " .. err) end)
+            client.close("Cannot connect to Pi: " .. err)
             return
         end
         pipe:read_start(function(read_err, chunk)
@@ -101,43 +191,81 @@ function M.connect(socket, callback)
                 if not boundary then break end
                 local line = buffer:sub(1, boundary - 1)
                 buffer = buffer:sub(boundary + 1)
+                ---@type boolean, unknown
                 local ok, response = pcall(vim.json.decode, line)
-                if
-                    not ok
-                    or type(response) ~= "table"
-                    or response.version ~= 1
-                    or type(response.ok) ~= "boolean"
-                    or type(response.requestId) ~= "string"
-                    or (response.ok and type(response.result) ~= "table")
-                    or (not response.ok and type(response.error) ~= "string")
-                then
-                    client.close("Invalid Parley acknowledgement")
-                    return
-                end
-                local entry = client.pending[response.requestId]
-                if not entry then
-                    client.close("Unmatched Parley acknowledgement")
-                    return
-                end
-                client.pending[response.requestId] = nil
-                entry.timer:stop()
-                entry.timer:close()
-                vim.schedule(function()
-                    if response.ok then
-                        entry.callback(response.result)
-                    else
-                        entry.callback(nil, response.error or "Pi rejected request")
+                if ok and type(response) == "table" and type(response.action) == "string" then
+                    if
+                        response.version ~= 1
+                        or type(response.requestId) ~= "string"
+                        or not on_request
+                    then
+                        client.close("Unexpected Pi request")
+                        return
                     end
-                end)
+                    -- Header validation above does not validate the application payload.
+                    ---@cast response ParleyClient.Request
+                    vim.schedule(function()
+                        if client.closed then return end
+                        local handled, result, handler_err = pcall(on_request, response)
+                        if not handled then
+                            handler_err, result = tostring(result), nil
+                        end
+                        pipe:write(vim.json.encode({
+                            version = 1,
+                            requestId = response.requestId,
+                            ok = result ~= nil,
+                            result = result,
+                            error = handler_err
+                                or (result == nil and "Unsupported Pi request" or nil),
+                        }) .. "\n", function(write_err)
+                            if write_err then
+                                client.close("Editor result write failed: " .. write_err)
+                            end
+                        end)
+                    end)
+                else
+                    if
+                        not ok
+                        or type(response) ~= "table"
+                        or response.version ~= 1
+                        or type(response.ok) ~= "boolean"
+                        or type(response.requestId) ~= "string"
+                        or (response.ok and type(response.result) ~= "table")
+                        or (not response.ok and type(response.error) ~= "string")
+                    then
+                        client.close("Invalid Parley acknowledgement")
+                        return
+                    end
+                    ---@cast response ParleyClient.Response
+                    local entry = client.pending[response.requestId]
+                    if not entry then
+                        client.close("Unmatched Parley acknowledgement")
+                        return
+                    end
+                    client.pending[response.requestId] = nil
+                    entry.timer:stop()
+                    entry.timer:close()
+                    vim.schedule(function()
+                        if response.ok then
+                            entry.callback(response.result)
+                        else
+                            entry.callback(nil, response.error or "Pi rejected request")
+                        end
+                    end)
+                end
             end
         end)
-        vim.schedule(function() callback(client) end)
+        complete_connect(client)
     end)
     return client
 end
 
----Discover only live reviews in the canonical workspace. Stale sockets are never deleted by Neovim.
-function M.discover(cwd, callback)
+---Discovery reads advertisements only. Attach must verify them over the socket.
+---Stale sockets/leases are never deleted by Neovim.
+---Return newly decoded advertisements; callers may retain/mutate their own copies.
+---@param cwd string
+---@param callback fun(endpoints: ParleyClient.Endpoint[]?, err: string?, root: string?)
+function M.endpoints(cwd, callback)
     local root, err = M.workspace(cwd)
     if not root then
         callback(nil, err)
@@ -146,14 +274,16 @@ function M.discover(cwd, callback)
     local directory = vim.fs.joinpath(M.state_directory(), "endpoints")
     local scan, scan_err, code = uv.fs_scandir(directory)
     if not scan then
-        callback(nil, code == "ENOENT" and "Run /review in Pi first" or scan_err)
+        callback(nil, code == "ENOENT" and "Waiting for Pi in this workspace" or scan_err)
         return
     end
+    ---@type ParleyClient.Endpoint[]
     local endpoints = {}
     while true do
         local name = uv.fs_scandir_next(scan)
         if not name then break end
         if name:match("%.json$") then
+            ---@type boolean, unknown
             local ok, descriptor = pcall(
                 function()
                     return vim.json.decode(
@@ -161,55 +291,89 @@ function M.discover(cwd, callback)
                     )
                 end
             )
-            if not ok then
+            if not ok or type(descriptor) ~= "table" then
                 callback(nil, "Invalid Pi discovery record: " .. name)
                 return
             end
-            if descriptor.workspace == root and descriptor.version == 1 and descriptor.socket then
+            if descriptor.workspace == root then
+                if
+                    descriptor.version ~= 1
+                    or type(descriptor.socket) ~= "string"
+                    or descriptor.socket:sub(1, 1) ~= "/"
+                then
+                    callback(nil, "Incomplete or unsupported Pi discovery record: " .. name)
+                    return
+                end
+                ---@cast descriptor ParleyClient.Endpoint
                 endpoints[#endpoints + 1] = descriptor
             end
         end
     end
     if #endpoints == 0 then
-        callback(nil, "Run /review in Pi for this workspace first")
+        callback(nil, "Waiting for Pi in this workspace")
         return
     end
-    local reviews, errors, remaining = {}, {}, #endpoints
-    for _, endpoint in ipairs(endpoints) do
-        M.connect(endpoint.socket, function(client, connect_err)
-            local function finish()
-                remaining = remaining - 1
-                if remaining == 0 then
-                    if #errors > 0 then
-                        callback(nil, table.concat(errors, "\n"))
-                    else
-                        callback(reviews)
-                    end
-                end
-            end
-            if not client then
-                errors[#errors + 1] = connect_err
-                finish()
-                return
-            end
-            client.request("list", nil, nil, function(items, list_err)
-                client.close()
-                if list_err then
-                    errors[#errors + 1] = list_err
-                elseif type(items) ~= "table" then
-                    errors[#errors + 1] = "Invalid Pi review list"
-                else
-                    for _, item in ipairs(items) do
-                        if item.status == "open" then
-                            item.endpoint = endpoint
-                            reviews[#reviews + 1] = item
+    callback(endpoints, nil, root)
+end
+
+---@class ParleyClient.ReviewListing
+---@field id unknown
+---@field status 'open'
+---@field endpoint ParleyClient.Endpoint Assigned locally, not trusted from Pi.
+---@field [string] unknown Other review fields are validated by the review handler.
+
+---Legacy review discovery remains an explicit list request, not bridge activation.
+---@param cwd string
+---@param callback fun(reviews: ParleyClient.ReviewListing[]?, err: string?)
+function M.discover(cwd, callback)
+    M.endpoints(cwd, function(endpoints, err, root)
+        if not endpoints then
+            callback(nil, err)
+            return
+        end
+        ---@type ParleyClient.ReviewListing[]
+        local reviews = {}
+        ---@type string[]
+        local errors = {}
+        local remaining = #endpoints
+        for _, endpoint in ipairs(endpoints) do
+            M.connect(endpoint.socket, function(client, connect_err)
+                local function finish()
+                    remaining = remaining - 1
+                    if remaining == 0 then
+                        if #errors > 0 then
+                            callback(nil, table.concat(errors, "\n"))
+                        else
+                            callback(reviews)
                         end
                     end
                 end
-                finish()
-            end, root)
-        end)
-    end
+                if not client then
+                    errors[#errors + 1] = connect_err
+                    finish()
+                    return
+                end
+                client.request("list", nil, nil, function(items, list_err)
+                    client.close()
+                    if list_err then
+                        errors[#errors + 1] = list_err
+                    elseif type(items) ~= "table" then
+                        errors[#errors + 1] = "Invalid Pi review list"
+                    else
+                        for _, item in ipairs(items) do
+                            if item.status == "open" then
+                                -- Only the open status is selected here, not the review schema.
+                                ---@cast item ParleyClient.ReviewListing
+                                item.endpoint = endpoint
+                                reviews[#reviews + 1] = item
+                            end
+                        end
+                    end
+                    finish()
+                end, root)
+            end)
+        end
+    end)
 end
 
 return M

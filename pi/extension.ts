@@ -8,10 +8,14 @@ import { TurnRunner, TurnDeferred, INITIAL_PROMPT, REVIEW_PROMPT, CONCLUSION_PRO
 import { sessionFromBranch, prepareContext, type PreparationInput } from "./preparation.ts";
 import { registerPlanning, planningSession, workspaceSession, WORKSPACE } from "./planning.ts";
 
-// Factory only registers capabilities. Socket/lease creation is lazy and session_shutdown owns cleanup.
+// Factory only registers capabilities. Session startup advertises the passive bridge;
+// explicit review actions own recovery/execution. Shutdown owns all resources.
 export default function parley(pi: ExtensionAPI) {
   pi.registerFlag("parley-preparation-model", { type: "string", description: "Preparation model override (provider/id); otherwise PARLEY_PREPARATION_MODEL or the saved workspace default." });
-  let connection: Connection | undefined, runner: TurnRunner | undefined, context: ExtensionContext | undefined;
+  // The passive connection lives for the session; the runner exists only after review activation.
+  let connection: Connection | undefined;
+  let runner: TurnRunner | undefined;
+  let context: ExtensionContext | undefined;
   let codingPending = false, stopping = false, creating = false, reconnecting = false, offering = false;
   let dialogs = 0;
   let generation = 0;
@@ -78,17 +82,25 @@ export default function parley(pi: ExtensionAPI) {
   pi.on("session_before_compact", waitForReview);
   pi.on("session_before_tree", waitForReview);
   pi.on("session_start", async (_event, ctx) => {
-    generation++; context = ctx; stopping = false; codingPending = false; offering = false;
+    if (ctx.mode !== "tui") return;
+    generation++;
+    context = ctx;
+    stopping = false;
+    codingPending = false;
+    offering = false;
     renderActivity();
-    const plan = planningSession(ctx), workspace = workspaceSession(ctx);
+    const plan = planningSession(ctx);
+    const workspace = workspaceSession(ctx);
     const root = plan?.root ?? workspace?.root;
-    if (!root) return;
     try {
-      await ensureConnection(root, workspace?.processId === process.pid);
-      await planning.attached(ctx);
+      const workspaceRoot = root ?? (await discover(ctx.cwd)).root;
+      await ensureBridge(workspaceRoot);
+      // Retained reviews remain inert until an explicit review action.
+      if (plan) await planning.attached(ctx);
     } catch (error) {
       await planning.attachmentError(error);
-      ctx.ui.notify(`Parley reconnect: ${String(error)}. Frozen review contents retained.`, "error");
+      ctx.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload in a workspace");
+      ctx.ui.notify(`Parley bridge: ${String(error)}. No review activated.`, "error");
     }
   });
   // The coding turn waits for an already-running review call. Conversely, review calls start only at idle.
@@ -104,26 +116,84 @@ export default function parley(pi: ExtensionAPI) {
   pi.on("ui_prompt_start", () => { dialogs++; });
   pi.on("ui_prompt_end", () => { dialogs = Math.max(0, dialogs - 1); setImmediate(kick); });
   pi.on("session_shutdown", async () => {
-    stopping = true; generation++;
-    if (idleTimer) clearInterval(idleTimer); idleTimer = undefined;
-    if (activityTimer) clearInterval(activityTimer); activityTimer = undefined;
+    stopping = true;
+    generation++;
+    if (idleTimer) clearInterval(idleTimer);
+    idleTimer = undefined;
+    if (activityTimer) clearInterval(activityTimer);
+    activityTimer = undefined;
     if (context?.mode === "tui") context.ui.setStatus("parley", undefined);
+    if (context?.mode === "tui") context.ui.setStatus("parley-bridge", undefined);
     activity = undefined;
-    try { await runner?.stop(); }
-    finally { await connection?.stop(); runner = undefined; connection = undefined; context = undefined; }
+    try {
+      await runner?.stop();
+    } finally {
+      await connection?.stop();
+      runner = undefined;
+      connection = undefined;
+      context = undefined;
+    }
   });
-  async function ensureConnection(root: string, preserveQueued = false) {
+  async function ensureBridge(root: string): Promise<void> {
     if (connection) {
-      if (connection.root !== root) throw new Error("This Pi runtime already owns reviews in another workspace");
+      if (connection.root !== root) throw new Error("This Pi runtime already owns another workspace");
       return;
     }
     const token = generation;
+    const owner = new Connection(stateDirectory(), root);
+    owner.origin = () => context ? {
+      sessionId: context.sessionManager.getSessionId(),
+      sessionFile: context.sessionManager.getSessionFile(),
+      leafId: context.sessionManager.getLeafId(),
+    } : undefined;
+    owner.onPeersChanged = () => {
+      if (context?.mode === "tui" && !stopping) {
+        context.ui.setStatus("parley-bridge", `Parley bridge · ${owner.bridgeChoices().length} editor(s)`);
+      }
+    };
+    // Explicit submissions activate review handling; connecting or pinging never does.
+    owner.onSubmit = reviewId => {
+      void ensureConnection(root, true)
+        .then(() => {
+          if (connection === owner && runner) owner.onSubmit(reviewId);
+        })
+        .catch(error => notify(`Parley submitted request retained: ${String(error)}`));
+    };
+    owner.onFinish = (reviewId, collectionId, handoffId) => {
+      planning.request(reviewId, collectionId, handoffId);
+      kick();
+    };
+    owner.onFailure = async error => {
+      stopping = true;
+      context?.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload");
+      context?.ui.notify(`Parley bridge: ${error.message}. /reload to reconnect.`, "error");
+    };
+    await owner.start();
+    // A session change while startup awaited must not publish an obsolete owner.
+    if (stopping || generation !== token) {
+      await owner.stop();
+      return;
+    }
+    connection = owner;
+    owner.onPeersChanged();
+  }
+  let activating: Promise<void> | undefined;
+  function ensureConnection(root: string, preserveQueued = false): Promise<void> {
+    if (activating) return activating;
+    activating = activateConnection(root, preserveQueued).finally(() => {
+      activating = undefined;
+    });
+    return activating;
+  }
+  async function activateConnection(root: string, preserveQueued = false): Promise<void> {
+    await ensureBridge(root);
+    if (runner || !connection) return;
+    const token = generation;
     reconnecting = true;
     try {
-      const owner = new Connection(stateDirectory(), root);
-      await owner.start(preserveQueued);
-      if (stopping || generation !== token) { await owner.stop(); return; }
-      connection = owner;
+      const owner = connection;
+      await owner.serial(() => owner.activateReviews(preserveQueued));
+      if (stopping || generation !== token) return;
       runner = new TurnRunner(owner,
         available,
         async (review, turn, signal) => {
@@ -210,6 +280,7 @@ export default function parley(pi: ExtensionAPI) {
       owner.origin = () => context ? { sessionId: context.sessionManager.getSessionId(), sessionFile: context.sessionManager.getSessionFile(), leafId: context.sessionManager.getLeafId() } : undefined;
       owner.onFinish = (reviewId, collectionId, handoffId) => { planning.request(reviewId, collectionId, handoffId); kick(); };
       owner.onFailure = async error => {
+        context?.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload");
         setActivity({ state: "error", text: "Workspace socket disconnected · /reload to reconnect (review retained)" });
         stopping = true;
         notify(`Parley socket failed: ${error.message}. Reload Pi to reconnect; review contents are retained.`);
