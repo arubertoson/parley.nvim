@@ -2,7 +2,7 @@
 -- arubertoson/nvim: lua/aru/workspace/review_composer.lua.
 ---Reserved-space prose editor, without legacy review/workflow ownership.
 ---The caller owns each hidden buffer and native undo tree. This module owns
----one editor window, its borrowed inline room, and display/lifecycle hooks.
+---one editor window, its footer, borrowed inline room and display/lifecycle hooks.
 -- Resolve sibling modules from this directory's require path when copied.
 local module_path = ...
 local style = require(module_path .. ".style")
@@ -34,6 +34,7 @@ local api = vim.api
 ---@field changed fun() Refresh caller presentation after releasing room.
 
 ---@class ParleyComposer.Mapping
+---@field name string Composer action; aliases share one footer hint.
 ---@field mode string
 ---@field key string
 ---@field action fun()|string
@@ -45,6 +46,7 @@ local api = vim.api
 ---@field note ParleyComposer.Draft Borrowed; local saves/cursor mutate it.
 ---@field source_win integer
 ---@field source_buf integer
+---@field source_tick integer Source edits interrupt presentation; layout changes do not.
 ---@field source_view table
 ---@field options ParleyComposer.Presentation
 ---@field keymaps table<string, string[]> Resolved key choices for this editor.
@@ -54,8 +56,8 @@ local api = vim.api
 ---@field group integer
 ---@field display? table Bounded source/view fingerprint after our last layout.
 ---@field refreshing boolean
----@field closing boolean
----@field resize_pending boolean
+---@field refresh_pending boolean One coalesced layout/lifecycle check.
+---@field footer ParleyComposer.HelpFooter Non-focusing help for editors without source room.
 
 ---@type ParleyComposer.Editor?
 local current
@@ -84,6 +86,32 @@ local display_options = {
 local function source_available(editor)
     return api.nvim_win_is_valid(editor.source_win)
         and api.nvim_win_get_buf(editor.source_win) == editor.source_buf
+end
+
+local function editor_available(editor)
+    return source_available(editor)
+        and api.nvim_buf_get_changedtick(editor.source_buf) == editor.source_tick
+        and api.nvim_win_is_valid(editor.window)
+        and api.nvim_win_get_buf(editor.window) == editor.note.buffer
+end
+
+local function remember_cursor(editor)
+    if
+        api.nvim_win_is_valid(editor.window)
+        and api.nvim_win_get_buf(editor.window) == editor.note.buffer
+    then
+        editor.note.cursor = editor.resume_cursor or api.nvim_win_get_cursor(editor.window)
+    end
+end
+
+-- Retained cursors can include the Insert-mode position beyond the final byte.
+-- Without one, opening an existing note starts after its final character.
+local function entry_cursor(note)
+    local count = api.nvim_buf_line_count(note.buffer)
+    local row = math.max(1, math.min(note.cursor and note.cursor[1] or count, count))
+    local line = api.nvim_buf_get_lines(note.buffer, row - 1, row, false)[1]
+    local column = note.cursor and note.cursor[2] or #line
+    return { row, math.max(0, math.min(column, #line)) }
 end
 
 function M.owns_source_window(window)
@@ -128,17 +156,14 @@ function M.close(restore)
     end
     current = nil
 
-    help.close()
+    help.close(editor.footer)
     api.nvim_del_augroup_by_id(editor.group)
     api.nvim_set_decoration_provider(assert(display_namespace), {})
     local focused = api.nvim_get_current_win() == editor.window
-    if api.nvim_win_is_valid(editor.window) then
-        if api.nvim_win_get_buf(editor.window) == editor.note.buffer then
-            editor.note.cursor = editor.resume_cursor or api.nvim_win_get_cursor(editor.window)
-        end
-        if focused then
-            vim.cmd.stopinsert()
-        end
+        and api.nvim_win_get_buf(editor.window) == editor.note.buffer
+    remember_cursor(editor)
+    if focused then
+        vim.cmd.stopinsert()
     end
 
     restore_bindings(editor)
@@ -148,11 +173,21 @@ function M.close(restore)
     end
     -- Restore inactive cards before closing the float triggers focus redraws.
     editor.options.changed()
-    if api.nvim_win_is_valid(editor.window) then
+    if
+        api.nvim_win_is_valid(editor.window)
+        and api.nvim_win_get_buf(editor.window) == editor.note.buffer
+    then
         api.nvim_win_close(editor.window, true)
     end
-    if restore and focused and source_available(editor) then
-        api.nvim_set_current_win(editor.source_win)
+    -- Closing normally returns to the source. Honour hooks that instead opened
+    -- another editor or moved focus elsewhere; never take their focus back.
+    if
+        restore
+        and focused
+        and current == nil
+        and source_available(editor)
+        and api.nvim_get_current_win() == editor.source_win
+    then
         vim.fn.winrestview(editor.source_view)
     end
 end
@@ -211,15 +246,14 @@ local function display_signature(editor)
     end)
 end
 
-local function history_label(editor)
-    local tree = vim.fn.undotree(editor.note.buffer)
-    local text = api.nvim_buf_get_lines(editor.note.buffer, 0, -1, false)
-    local saved = editor.note.saved_lines and vim.deep_equal(text, editor.note.saved_lines)
-    return ("history %d/%d · %s"):format(
-        tree.seq_cur + 1,
-        tree.seq_last + 1,
-        saved and "saved" or "unsaved"
-    )
+local function footer_row(editor, width)
+    if api.nvim_get_current_win() ~= editor.window then
+        return
+    end
+    local mode = vim.fn.mode():sub(1, 1)
+    if mode == "n" or mode == "i" then
+        return help.row(editor.note.buffer, editor.bindings, mode, width)
+    end
 end
 
 local function geometry(editor, reveal)
@@ -237,6 +271,7 @@ local function geometry(editor, reveal)
     if not first or not last or not presentation_room then
         local width = math.min(100, window_width - 8)
         api.nvim_win_set_config(editor.window, { width = width })
+        local footer = footer_row(editor, width)
         local rows = api.nvim_win_text_height(editor.window, { max_height = 7 }).all
         local height = math.min(math.max(1, rows), 6, window_height - 4)
         return {
@@ -248,12 +283,9 @@ local function geometry(editor, reveal)
             height = height,
             border = "rounded",
             hide = false,
-            title = " You · "
-                .. editor.options.source_label
-                .. " · unplaced · "
-                .. history_label(editor)
-                .. " ",
-        }
+            title = " You · " .. editor.options.source_label .. " · unplaced ",
+        },
+            footer
     end
 
     -- Do not paint an editor over another plugin's virtual text/display editor.
@@ -280,10 +312,7 @@ local function geometry(editor, reveal)
     end
 
     local indent, width, padding = style.layout(editor.source_win, first)
-    local heading = style.wrap(
-        "You · " .. style.label(first, last) .. " · editing · " .. history_label(editor),
-        width
-    )
+    local heading = style.wrap("You · " .. style.label(first, last) .. " · editing", width)
     local available = window_height - #heading - 4
     if available < 1 then
         return
@@ -304,6 +333,11 @@ local function geometry(editor, reveal)
         room[index + 1] = style.card_line(indent, width, padding, {
             { text, "ParleyReviewNoteHeading" },
         }, true)
+    end
+    -- Reuse bottom padding: toggling help or changing modes cannot grow the room.
+    local footer = footer_row(editor, width)
+    if footer then
+        room[#room] = style.footer_line(indent, width, padding, footer)
     end
     local preceding = presentation_room.reserve(last, room)
 
@@ -356,76 +390,101 @@ local function geometry(editor, reveal)
     return config
 end
 
+local function hide_editor_gutter(window)
+    vim.wo[window].number = false
+    vim.wo[window].relativenumber = false
+    vim.wo[window].signcolumn = "no"
+    vim.wo[window].statuscolumn = ""
+    vim.wo[window].foldcolumn = "0"
+end
+
 local function refresh(editor, reveal)
-    if current ~= editor or editor.closing then
+    if current ~= editor then
         return
     end
-    if
-        not source_available(editor)
-        or not api.nvim_win_is_valid(editor.window)
-        or api.nvim_win_get_buf(editor.window) ~= editor.note.buffer
-    then
+    if not editor_available(editor) then
         M.close(false)
         return
     end
 
     editor.refreshing = true
-    local config = geometry(editor, reveal)
-    if not config then
-        editor.refreshing = false
+    -- Both initial and scheduled layout own cleanup on failure. A bad host
+    -- callback must not leave an inert editor marked as permanently refreshing.
+    local laid_out, result = pcall(function()
+        hide_editor_gutter(editor.window)
+        local config, footer = geometry(editor, reveal)
+        if config and current == editor then
+            api.nvim_win_set_config(editor.window, config)
+            if footer then
+                help.present(editor.footer, footer, {
+                    relative = "win",
+                    win = editor.source_win,
+                    row = config.row + config.height + 2,
+                    col = config.col + 1,
+                    width = config.width,
+                })
+            else
+                help.close(editor.footer)
+            end
+            editor.display = display_signature(editor)
+        end
+        return config
+    end)
+    editor.refreshing = false
+    if current ~= editor then
+        if not laid_out then
+            error(result, 0)
+        end
+        return
+    end
+    if not laid_out then
+        M.close(false)
+        error(result, 0)
+    end
+    if not result then
         M.close(false)
         vim.notify(
             "Parley: draft retained; no unobscured composer space at its source",
             vim.log.levels.INFO
         )
-        return
     end
-    api.nvim_win_set_config(editor.window, config)
-    editor.display = display_signature(editor)
-    editor.refreshing = false
 end
 
-local function schedule_close(editor)
-    if editor.closing then
+-- Observe events now, but lay out only after focus/option hooks have settled.
+-- Never hide a healthy editor or mutate windows from a redraw callback.
+local function schedule_refresh(editor)
+    if current ~= editor or editor.refreshing or editor.refresh_pending then
         return
     end
-    editor.closing = true
-    if api.nvim_win_is_valid(editor.window) then
-        api.nvim_win_set_config(editor.window, { hide = true })
-    end
+    editor.refresh_pending = true
     vim.schedule(function()
-        if current == editor then
-            M.close(false)
+        editor.refresh_pending = false
+        if current ~= editor then
+            return
         end
+        local focused = api.nvim_get_current_win()
+        if
+            not editor_available(editor)
+            or (focused ~= editor.source_win and focused ~= editor.window)
+        then
+            M.close(false)
+            return
+        end
+        refresh(editor, false)
     end)
 end
 
 local function invalidate_display()
     local editor = current
-    if not editor or editor.refreshing or editor.closing then
+    if not editor or editor.refreshing or editor.refresh_pending then
         return
     end
-    if not vim.deep_equal(editor.display, display_signature(editor)) then
-        schedule_close(editor)
+    if
+        not editor_available(editor)
+        or not vim.deep_equal(editor.display, display_signature(editor))
+    then
+        schedule_refresh(editor)
     end
-end
-
-local function schedule_resize(editor)
-    if editor.resize_pending or editor.closing then
-        return
-    end
-    editor.resize_pending = true
-    vim.schedule(function()
-        editor.resize_pending = false
-        if current ~= editor or editor.closing then
-            return
-        end
-        if not vim.deep_equal(editor.display, display_signature(editor)) then
-            schedule_close(editor)
-        else
-            refresh(editor, false)
-        end
-    end)
 end
 
 ---Accept locally without submitting a turn. Exposed for user-managed mappings.
@@ -434,7 +493,7 @@ function M.accept()
     if not editor then
         return
     end
-    if editor.closing or not vim.deep_equal(editor.display, display_signature(editor)) then
+    if not editor_available(editor) then
         M.close(false)
         return
     end
@@ -454,12 +513,23 @@ function M.accept()
     M.close(true)
 end
 
+---Help belongs only to the focused composer; source/note navigation owns no maps.
+function M.toggle_help()
+    local editor = current
+    if not editor or api.nvim_get_current_win() ~= editor.window or vim.fn.mode() ~= "n" then
+        return
+    end
+    help.toggle()
+    refresh(editor, false)
+end
+
 local function install_bindings(editor)
     local buffer = editor.note.buffer
     local function bind(name, modes, action, description)
         for _, mode in ipairs(modes) do
             for _, key in ipairs(editor.keymaps[name]) do
                 editor.bindings[#editor.bindings + 1] = {
+                    name = name,
                     mode = mode,
                     key = key,
                     action = action,
@@ -471,41 +541,21 @@ local function install_bindings(editor)
     end
 
     -- Install in a fixed order; later actions win if configured keys overlap.
-    bind("accept", { "n", "i" }, M.accept, "Accept note locally and close")
-    bind("accept_normal", { "n" }, M.accept, "Accept note locally and close")
-    bind("newline", { "i" }, "<CR>", "New line in note")
+    bind("accept", { "n", "i" }, M.accept, "save & close")
+    bind("accept_normal", { "n" }, M.accept, "save & close")
+    bind("newline", { "i" }, "<CR>", "new line")
     bind("close", { "n", "i" }, function()
         M.close(true)
-    end, "Return to notes; retain unfinished edits")
+    end, "close (keep draft)")
     for _, direction in ipairs({ { name = "next", step = 1 }, { name = "previous", step = -1 } }) do
         bind(direction.name, { "n", "i" }, function()
             M.close(true)
             editor.options.navigate(direction.step)
-        end, direction.step == 1 and "Next note" or "Previous note")
+        end, direction.step == 1 and "next note" or "previous note")
     end
 
-    local function show_help()
-        local bindings = {}
-        for _, mode in ipairs({ "n", "i" }) do
-            for _, mapping in ipairs(api.nvim_buf_get_keymap(buffer, mode)) do
-                if mapping.desc then
-                    bindings[#bindings + 1] =
-                        { mode = mode, key = mapping.lhs, description = mapping.desc }
-                end
-            end
-        end
-        bindings[#bindings + 1] =
-            { mode = "n", key = "u / <C-r>", description = "Native undo / redo" }
-        table.sort(bindings, function(left, right)
-            if left.key ~= right.key then
-                return left.key < right.key
-            end
-            return left.mode < right.mode
-        end)
-        help.toggle("Comment hotkeys", bindings)
-    end
-    bind("help", { "n", "i" }, show_help, "Show comment hotkeys")
-    bind("help_normal", { "n" }, show_help, "Show comment hotkeys")
+    bind("help", { "n" }, M.toggle_help, "hotkeys")
+    bind("help_normal", { "n" }, M.toggle_help, "hotkeys")
 
     api.nvim_buf_call(buffer, function()
         -- Snapshot before installing anything so aliases preserve the original
@@ -524,6 +574,16 @@ local function install_bindings(editor)
 end
 
 local function install_hooks(editor)
+    -- Record positions while the window still exists, including external closure.
+    api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "InsertLeavePre", "BufWinLeave" }, {
+        group = editor.group,
+        buffer = editor.note.buffer,
+        callback = function()
+            if current == editor then
+                remember_cursor(editor)
+            end
+        end,
+    })
     api.nvim_create_autocmd("ColorScheme", {
         group = editor.group,
         callback = style.refresh,
@@ -553,7 +613,8 @@ local function install_hooks(editor)
                 return
             end
             if event.buf == editor.note.buffer and event.event:match("^TextChanged") then
-                schedule_resize(editor)
+                remember_cursor(editor)
+                schedule_refresh(editor)
             else
                 invalidate_display()
             end
@@ -562,51 +623,41 @@ local function install_hooks(editor)
     api.nvim_create_autocmd("OptionSet", {
         group = editor.group,
         pattern = display_options,
-        callback = invalidate_display,
+        callback = function()
+            if api.nvim_get_current_win() == editor.window then
+                schedule_refresh(editor)
+            else
+                invalidate_display()
+            end
+        end,
     })
     api.nvim_create_autocmd({ "WinEnter", "BufEnter", "WinClosed", "BufWipeout" }, {
         group = editor.group,
         callback = function()
-            vim.schedule(function()
-                if current ~= editor then
-                    return
-                end
-                local focused = api.nvim_get_current_win()
-                if
-                    not source_available(editor)
-                    or not api.nvim_win_is_valid(editor.window)
-                    or api.nvim_win_get_buf(editor.window) ~= editor.note.buffer
-                    or (focused ~= editor.source_win and focused ~= editor.window)
-                then
-                    M.close(false)
-                end
-            end)
+            schedule_refresh(editor)
         end,
     })
-end
-
-local function hide_editor_gutter(window)
-    vim.wo[window].number = false
-    vim.wo[window].relativenumber = false
-    vim.wo[window].signcolumn = "no"
-    vim.wo[window].statuscolumn = ""
-    vim.wo[window].foldcolumn = "0"
+    api.nvim_create_autocmd("ModeChanged", {
+        group = editor.group,
+        buffer = editor.note.buffer,
+        callback = function()
+            -- Esc is native Insert -> Normal; mode hooks may alter our gutter.
+            schedule_refresh(editor)
+        end,
+    })
 end
 
 ---@return boolean entered
 function M.enter()
     local editor = current
-    if not editor or editor.closing then
+    if not editor then
         return false
     end
     local window = api.nvim_get_current_win()
     if window ~= editor.source_win and window ~= editor.window then
         return false
     end
-    if not source_available(editor) or not api.nvim_win_is_valid(editor.window) then
-        return false
-    end
-    if not vim.deep_equal(editor.display, display_signature(editor)) then
+    if not editor_available(editor) then
         M.close(false)
         return false
     end
@@ -629,8 +680,8 @@ function M.enter()
     else
         insertion_cursor = api.nvim_win_get_cursor(editor.window)
     end
-    refresh(editor, false)
-    if current ~= editor or editor.closing or api.nvim_get_current_win() ~= editor.window then
+    refresh(editor, true)
+    if current ~= editor or api.nvim_get_current_win() ~= editor.window then
         return false
     end
 
@@ -681,14 +732,15 @@ function M.show(note, options)
         bindings = {},
         source_win = options.source_win,
         source_buf = source_buffer,
+        source_tick = api.nvim_buf_get_changedtick(source_buffer),
         source_view = source_view,
         window = window,
-        resume_cursor = note.cursor,
+        resume_cursor = entry_cursor(note),
         group = api.nvim_create_augroup(module_path, { clear = true }),
         -- Hooks must not invalidate an editor before its first layout exists.
         refreshing = true,
-        closing = false,
-        resize_pending = false,
+        refresh_pending = false,
+        footer = {},
     }
     current = editor
 
@@ -710,9 +762,7 @@ function M.show(note, options)
         hide_editor_gutter(window)
         vim.wo[window].winhighlight =
             "Normal:ParleyReviewNoteActive,NormalFloat:ParleyReviewNoteActive,EndOfBuffer:ParleyReviewNoteActive"
-        if note.cursor then
-            api.nvim_win_set_cursor(window, note.cursor)
-        end
+        api.nvim_win_set_cursor(window, editor.resume_cursor)
         install_bindings(editor)
         install_hooks(editor)
         refresh(editor, true)

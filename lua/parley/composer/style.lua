@@ -46,6 +46,21 @@ function M.refresh()
         bg = background,
         italic = true,
     })
+
+    -- The small help annotation is darker than the prose, with quiet labels
+    -- and slightly clearer keys; neither should compete with the editor text.
+    local help_background = blend(normal.bg, 0, 0.2)
+    api.nvim_set_hl(0, "ParleyComposerHelp", {
+        fg = blend(normal.fg, help_background, 0.58),
+        bg = help_background,
+        italic = false,
+    })
+    api.nvim_set_hl(0, "ParleyComposerHelpKey", {
+        fg = blend(normal.fg, help_background, 0.4),
+        bg = help_background,
+        bold = false,
+        italic = false,
+    })
 end
 
 ---Use source indentation without changing source-window options.
@@ -92,6 +107,26 @@ function M.card_line(indent, width, padding, chunks, active)
         used = used + vim.fn.strdisplaywidth(chunk[1])
     end
     line[#line + 1] = { string.rep(" ", math.max(0, width + padding - used)), body }
+    return line
+end
+
+---Keep the composer's lower edge behind a compact annotation, without a role bar.
+---@param chunks ParleyNoteLine Already fitted to the editor width.
+---@return ParleyNoteLine
+function M.footer_line(indent, width, padding, chunks)
+    local line = {
+        { string.rep(" ", indent - padding), "Normal" },
+        { string.rep(" ", padding), "ParleyReviewNoteActive" },
+    }
+    local used = 0
+    for _, chunk in ipairs(chunks) do
+        line[#line + 1] = chunk
+        used = used + vim.fn.strdisplaywidth(chunk[1])
+    end
+    line[#line + 1] = {
+        string.rep(" ", math.max(0, width + padding - used)),
+        "ParleyReviewNoteActive",
+    }
     return line
 end
 

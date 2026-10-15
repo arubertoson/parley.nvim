@@ -12,18 +12,18 @@ local M = {}
 ---@field close? ParleyKeymapKeys Normal/Insert: close and retain unfinished edits.
 ---@field next? ParleyKeymapKeys Normal/Insert: visit the next note.
 ---@field previous? ParleyKeymapKeys Normal/Insert: visit the previous note.
----@field help? ParleyKeymapKeys Normal/Insert: toggle hotkey help.
----@field help_normal? ParleyKeymapKeys Normal-only help alias.
+---@field help? ParleyKeymapKeys Normal-only: toggle contextual hotkey footer.
+---@field help_normal? ParleyKeymapKeys Optional Normal-only help alias.
 
 local composer_defaults = {
     accept = "<CR>",
     accept_normal = "q",
     newline = { "<C-j>", "<C-CR>" },
-    close = { "<Esc>", "<C-c>" },
+    close = "<C-c>",
     next = "<C-n>",
     previous = "<C-p>",
-    help = "<F1>",
-    help_normal = "<leader>?",
+    help = "<leader>?",
+    help_normal = false,
 }
 
 ---An omitted action retains its defaults; false or an empty list disables it.
