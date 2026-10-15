@@ -51,7 +51,7 @@ function M.clear(view)
 end
 
 local function card(view, item, budget)
-    local indent, width, padding = style.layout(view.window, item.first)
+    local indent, width, padding = style.layout(view.window)
     local selected = item.note.id == view.selected
     local text = api.nvim_buf_get_lines(item.note.buffer, 0, -1, false)
     local state = "draft"
@@ -59,16 +59,13 @@ local function card(view, item, budget)
         state = vim.deep_equal(text, item.note.saved_lines) and "saved" or "unsaved edits"
     end
 
-    local heading = "You · " .. style.label(item.first, item.last) .. " · " .. state
-    local lines = { style.card_line(indent, width, padding, {}, selected) }
-    for index, value in ipairs(style.wrap(heading, width)) do
-        if index > budget - 2 then
-            break
-        end
-        lines[#lines + 1] = style.card_line(indent, width, padding, {
-            { value, "ParleyReviewNoteHeading" },
-        }, selected)
-    end
+    local heading = style.heading(item.note, state, item.first, item.last, width)
+    local lines = {
+        style.card_line(indent, width, padding, {}, selected),
+        style.card_line(indent, width, padding, {
+            { heading, "ParleyReviewNoteHeading" },
+        }, selected),
+    }
 
     local body = selected and "ParleyReviewNoteActive" or "ParleyReviewNote"
     for _, value in ipairs(text) do
@@ -127,7 +124,7 @@ local function render_row(view, row, items)
     if focus_first and focus_count and focus_first + focus_count - 1 > budget then
         local visible = {}
         if focus_first > 1 and focus_count < budget then
-            local indent, width, padding = style.layout(view.window, items[1].first)
+            local indent, width, padding = style.layout(view.window)
             visible[1] = style.card_line(indent, width, padding, {
                 { "Earlier notes", "ParleyReviewNoteHeading" },
             })

@@ -369,6 +369,7 @@ function M.comment(scope)
     local note = {
         id = serial,
         buffer = buffer,
+        created_at = os.time(),
         path = source.path,
         source_buf = source.buffer,
         namespace = anchors,

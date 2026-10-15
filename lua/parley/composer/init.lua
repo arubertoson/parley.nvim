@@ -16,6 +16,7 @@ local api = vim.api
 ---@field buffer integer Canonical text and native undo; never replaced on reopen.
 ---@field cursor? integer[] Row and byte column; Insert-mode columns may equal the line's byte length.
 ---@field saved_lines? string[] Last explicitly accepted local text, not a Pi turn.
+---@field created_at? integer Caller-supplied creation time in Unix seconds; absent when unknown.
 
 ---@class ParleyComposer.Room
 ---@field namespace integer Caller-owned virtual lines allowed below the source.
@@ -272,8 +273,13 @@ local function geometry(editor, reveal)
         local width = math.min(100, window_width - 8)
         api.nvim_win_set_config(editor.window, { width = width })
         local footer = footer_row(editor, width)
-        local rows = api.nvim_win_text_height(editor.window, { max_height = 7 }).all
-        local height = math.min(math.max(1, rows), 6, window_height - 4)
+        local available = window_height - 4
+        local rows = api.nvim_win_text_height(editor.window, {
+            start_row = 0,
+            end_row = api.nvim_buf_line_count(editor.note.buffer) - 1,
+            max_height = available,
+        }).all
+        local height = math.min(math.max(1, rows), available)
         return {
             relative = "win",
             win = editor.source_win,
@@ -311,9 +317,10 @@ local function geometry(editor, reveal)
         end
     end
 
-    local indent, width, padding = style.layout(editor.source_win, first)
-    local heading = style.wrap("You · " .. style.label(first, last) .. " · editing", width)
-    local available = window_height - #heading - 4
+    local indent, width, padding = style.layout(editor.source_win)
+    local heading = { style.heading(editor.note, "editing", first, last, width) }
+    local below = last < api.nvim_buf_line_count(editor.source_buf) and 1 or 0
+    local available = window_height - #heading - 3 - below
     if available < 1 then
         return
     end
@@ -322,24 +329,29 @@ local function geometry(editor, reveal)
     local content_rows = api.nvim_win_text_height(editor.window, {
         start_row = 0,
         end_row = api.nvim_buf_line_count(editor.note.buffer) - 1,
-        max_height = 7,
+        max_height = available,
     }).all
-    local content_height = math.min(math.max(1, content_rows), 6, available)
-    local room = {}
-    for _ = 1, content_height + #heading + 2 do
-        room[#room + 1] = style.card_line(indent, width, padding, {}, true)
-    end
-    for index, text in ipairs(heading) do
-        room[index + 1] = style.card_line(indent, width, padding, {
-            { text, "ParleyReviewNoteHeading" },
-        }, true)
-    end
-    -- Reuse bottom padding: toggling help or changing modes cannot grow the room.
+    -- Active prose grows to its wrapped content, bounded only by the viewport.
+    -- Inactive card truncation belongs to the caller, not this editing window.
+    local content_height = math.min(math.max(1, content_rows), available)
     local footer = footer_row(editor, width)
-    if footer then
-        room[#room] = style.footer_line(indent, width, padding, footer)
+    local function reserve_room()
+        local room = {}
+        for _ = 1, content_height + #heading + 2 do
+            room[#room + 1] = style.card_line(indent, width, padding, {}, true)
+        end
+        for index, text in ipairs(heading) do
+            room[index + 1] = style.card_line(indent, width, padding, {
+                { text, "ParleyReviewNoteHeading" },
+            }, true)
+        end
+        -- Reuse bottom padding: help never takes space away from the message.
+        if footer then
+            room[#room] = style.footer_line(indent, width, padding, footer)
+        end
+        return presentation_room.reserve(last, room)
     end
-    local preceding = presentation_room.reserve(last, room)
+    local preceding = reserve_room()
 
     local config
     api.nvim_win_call(editor.source_win, function()
@@ -350,7 +362,7 @@ local function geometry(editor, reveal)
             return
         end
 
-        local function space()
+        local function source_row()
             local position = vim.fn.winsaveview()
             if position.topline > last then
                 return
@@ -361,17 +373,31 @@ local function geometry(editor, reveal)
                 end_row = last - 1,
                 max_height = window_height + 1,
             }).all + position.topfill + preceding
-            local below = last < api.nvim_buf_line_count(editor.source_buf) and 1 or 0
-            if row + #room + below > window_height then
-                return
-            end
             return row
         end
 
-        local row = space()
-        if not row and reveal then
+        local row = source_row()
+        local room_height = content_height + #heading + 2
+        if reveal and (not row or row + room_height + below > window_height) then
             vim.cmd("normal! zt")
-            row = space()
+            row = source_row()
+        end
+        -- Wrapped source lines and preceding cards also consume space. Grow
+        -- without background source scrolling; overflow uses native scrolling
+        -- inside the composer rather than closing an otherwise healthy editor.
+        while row do
+            local remaining = window_height - row - #heading - 2 - below
+            if remaining < 1 then
+                return
+            end
+            if content_height <= remaining then
+                break
+            end
+            -- Each pass strictly shrinks the room. The host may change the
+            -- number of preceding cards when its reservation becomes smaller.
+            content_height = remaining
+            preceding = reserve_room()
+            row = source_row()
         end
         if not row then
             return

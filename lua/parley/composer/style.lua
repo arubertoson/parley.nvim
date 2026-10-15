@@ -63,18 +63,13 @@ function M.refresh()
     })
 end
 
----Use source indentation without changing source-window options.
+---Fixed gutter-aware rail, independent of source indentation/horizontal scroll.
 ---@return integer indent, integer width, integer padding
-function M.layout(window, first)
+function M.layout(window)
     local available = api.nvim_win_get_width(window)
     local padding = math.min(3, math.floor((available - 1) / 2))
-    local indent = api.nvim_win_call(window, function()
-        local gutter = vim.fn.getwininfo(window)[1].textoff
-        local indentation = vim.fn.indent(first) + 4 - vim.fn.winsaveview().leftcol
-        return math.max(gutter, gutter + indentation)
-    end)
-
-    indent = math.min(available - padding - 1, math.max(padding, indent))
+    local gutter = vim.fn.getwininfo(window)[1].textoff
+    local indent = math.min(available - padding - 1, math.max(padding, gutter + 4))
     return indent, math.min(100, available - indent - padding), padding
 end
 
@@ -167,6 +162,40 @@ function M.wrap(text, width)
     end
     lines[#lines + 1] = line
     return lines
+end
+
+---One-row human-note heading: role/state left, creation date/source range right.
+---Unknown dates stay absent. Metadata yields space before the role/state does.
+---@param note ParleyComposer.Draft
+---@param state string
+---@param first integer
+---@param last integer
+---@param width integer
+---@return string
+function M.heading(note, state, first, last, width)
+    local left = "You · " .. state
+    local left_width = vim.fn.strdisplaywidth(left)
+    if left_width > width then
+        return M.wrap(left, width)[1]
+    end
+
+    local right = M.label(first, last)
+    if note.created_at then
+        for _, format in ipairs({ "%Y-%m-%d %H:%M", "%Y-%m-%d" }) do
+            local dated = os.date(format, note.created_at) .. " · " .. right
+            if left_width + 1 + vim.fn.strdisplaywidth(dated) <= width then
+                right = dated
+                break
+            end
+        end
+    end
+    if left_width + 1 + vim.fn.strdisplaywidth(right) > width then
+        right = first == last and ("L%d"):format(first) or ("L%d–%d"):format(first, last)
+    end
+    if left_width + 1 + vim.fn.strdisplaywidth(right) > width then
+        right = ""
+    end
+    return left .. string.rep(" ", width - left_width - vim.fn.strdisplaywidth(right)) .. right
 end
 
 return M
