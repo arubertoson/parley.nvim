@@ -7,6 +7,7 @@ local composer = require("parley.composer")
 local config = require("parley.config")
 local discussion = require("parley.discussion")
 local inline = require("parley.inline")
+local keys = require("parley.composer.keymaps")
 local style = require("parley.composer.style")
 local thread = require("parley.thread")
 local workspace = require("parley.workspace")
@@ -22,6 +23,7 @@ local api = vim.api
 ---@alias ParleyDemo.Draft ParleyDiscussion.Draft
 
 ---@class ParleyDemo.Item: ParleyInline.Item
+---@field thread? ParleyThread Borrowed immutable history for presentation.
 ---@field note ParleyDemo.Draft Stable source-card identity, also the initial comment draft.
 ---@field drafts? table<string, ParleyDemo.Draft> Exact parent ID to unsent human draft.
 ---@field revisions? table<string, ParleyDemo.Draft> Submitted human ID to unsent revision draft.
@@ -257,42 +259,83 @@ end
 ---@param demo ParleyDemo
 local function refresh(demo)
     if source_available(demo) and demo.view then
+        for _, item in ipairs(demo.items) do
+            if item.thread then
+                local pending = item.pending
+                local latest = item.thread.messages[#item.thread.messages]
+                item.preview = pending
+                        and {
+                            buffer = pending.buffer,
+                            role = "human",
+                            state = ("draft · %d entries"):format(#item.thread.messages + 1),
+                            created_at = pending.created_at,
+                        }
+                    or latest and {
+                        lines = latest.lines,
+                        role = latest.role,
+                        state = ("%d messages"):format(#item.thread.messages),
+                        created_at = latest.created_at,
+                    }
+                    or { lines = { "No messages yet" }, state = "0 messages" }
+            end
+        end
         inline.update(demo.view, demo.buffer, demo.items, demo.selected and demo.selected.note.id)
     end
 end
 
 ---@param demo ParleyDemo
 local function detach(demo)
-    if demo.discussion then
-        discussion.close(demo.discussion, false)
-        demo.discussion = nil
+    -- Unpublish these exact resources before anything can run user hooks.
+    local reader, group, view = demo.discussion, demo.group, demo.view
+    local window, bindings = demo.window, demo.bindings
+    local editor = window and composer.for_source_window(window)
+    demo.discussion, demo.group, demo.view, demo.window = nil, nil, nil, nil
+    demo.bindings = {}
+    local failed, failure
+    local function finish(action)
+        local ok, err = pcall(action)
+        if not ok and not failed then
+            failed, failure = true, err
+        end
     end
-    if demo.window and composer.owns_source_window(demo.window) then
-        composer.close(false)
-    end
-    if demo.group then
-        api.nvim_del_augroup_by_id(demo.group)
-        demo.group = nil
-    end
-    if demo.view then
-        inline.clear(demo.view)
-        demo.view = nil
-    end
-    if api.nvim_buf_is_loaded(demo.buffer) then
-        api.nvim_buf_call(demo.buffer, function()
-            for _, binding in ipairs(demo.bindings) do
-                local mapping = vim.fn.maparg(binding.key, binding.mode, false, true)
-                if mapping.buffer == 1 and mapping.callback == binding.action then
-                    vim.keymap.del(binding.mode, binding.key, { buffer = demo.buffer })
-                    if binding.original.buffer == 1 then
-                        vim.fn.mapset(binding.mode, false, binding.original)
-                    end
-                end
-            end
+    if group then
+        finish(function()
+            api.nvim_del_augroup_by_id(group)
         end)
     end
-    demo.bindings = {}
-    demo.window = nil
+    if view then
+        finish(function()
+            inline.clear(view)
+        end)
+    end
+    if api.nvim_buf_is_loaded(demo.buffer) then
+        finish(function()
+            api.nvim_buf_call(demo.buffer, function()
+                for _, binding in ipairs(bindings) do
+                    local mapping = vim.fn.maparg(binding.key, binding.mode, false, true)
+                    if mapping.buffer == 1 and mapping.callback == binding.action then
+                        vim.keymap.del(binding.mode, binding.key, { buffer = demo.buffer })
+                        if binding.original.buffer == 1 then
+                            vim.fn.mapset(binding.mode, false, binding.original)
+                        end
+                    end
+                end
+            end)
+        end)
+    end
+    if reader then
+        finish(function()
+            discussion.close(reader, false)
+        end)
+    end
+    if editor then
+        finish(function()
+            composer.close(false, editor)
+        end)
+    end
+    if failed then
+        error(failure, 0)
+    end
 end
 
 ---Resume the same canonical buffer for each exact reply target. Closing or
@@ -360,25 +403,49 @@ show = function(demo, item, entry)
     if not source_available(demo) or api.nvim_get_current_win() ~= demo.window then
         return
     end
-    if demo.discussion then
-        discussion.close(demo.discussion, false)
-        demo.discussion = nil
+    local source_window = demo.window
+    local previous = demo.discussion
+    local editor = composer.for_source_window(source_window)
+    demo.discussion = nil
+    if previous then
+        discussion.close(previous, false)
     end
-    composer.close(false)
+    if editor then
+        composer.close(false, editor)
+    end
+    if
+        not source_available(demo)
+        or demo.window ~= source_window
+        or api.nvim_get_current_win() ~= source_window
+        or demo.discussion
+        or composer.owns_source_window(source_window)
+    then
+        return
+    end
     demo.selected = item
     refresh(demo)
     local view = assert(demo.view)
     inline.reveal(view)
+    if
+        not source_available(demo)
+        or demo.view ~= view
+        or api.nvim_get_current_win() ~= demo.window
+        or demo.discussion
+        or composer.owns_source_window(demo.window)
+    then
+        return
+    end
     if not entry then
         return
     end
+    local room_owner = {}
     local room = {
         namespace = view.namespace,
         reserve = function(row, lines)
-            return inline.reserve(view, item.note.id, row, lines)
+            return inline.reserve(view, item.note.id, row, lines, room_owner)
         end,
         release = function()
-            inline.release(view)
+            inline.release(view, room_owner)
         end,
     }
     if item.thread then
@@ -425,8 +492,9 @@ show = function(demo, item, entry)
         end)
         if not opened then
             if demo.discussion then
-                discussion.close(demo.discussion, false)
+                local reader = demo.discussion
                 demo.discussion = nil
+                pcall(discussion.close, reader, false)
             end
             error(failure, 0)
         end
@@ -562,7 +630,8 @@ local function attach(demo)
                 action.run()
             end
         end
-        for _, key in ipairs(demo.keys.review[action.name]) do
+        for _, configured_key in ipairs(demo.keys.review[action.name]) do
+            local key = keys.concrete(configured_key)
             demo.bindings[#demo.bindings + 1] = {
                 mode = action.mode,
                 key = key,
@@ -644,13 +713,12 @@ function M.open()
         api.nvim_win_set_buf(demo.window, demo.buffer)
     end
     if not demo.view then
-        demo.keys = config.get()
         local attached, failure = pcall(function()
             demo.view = inline.open(assert(demo.window))
             attach(demo)
         end)
         if not attached then
-            detach(demo)
+            pcall(detach, demo)
             error(failure, 0)
         end
     end
@@ -718,10 +786,25 @@ function M.reload()
         return
     end
 
+    local previous_focus = api.nvim_get_current_win()
     if demo then
         detach(demo)
     end
-    composer.close(false)
+    -- Closing windows can synchronously open replacement UI or move focus.
+    -- Do not invalidate its module ownership or reopen over that action.
+    local interrupted = demo ~= nil
+        and (demo.view ~= nil or demo.discussion ~= nil or demo.group ~= nil)
+    for _, candidate in ipairs(api.nvim_list_wins()) do
+        interrupted = interrupted or composer.owns_source_window(candidate)
+    end
+    local focused = api.nvim_get_current_win()
+    if interrupted or (focused ~= previous_focus and focused ~= window) then
+        vim.notify(
+            "Parley: reload interrupted by a presentation/focus hook; modules were not replaced",
+            vim.log.levels.WARN
+        )
+        return
+    end
     for _, module in ipairs(modules) do
         for name in pairs(module.target) do
             module.target[name] = nil

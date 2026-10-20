@@ -9,16 +9,23 @@ local api = vim.api
 
 ---@class ParleyInline.Item
 ---@field note ParleyComposer.Draft Borrowed editor-owned text.
----@field thread? ParleyThread Borrowed read-only conversation.
----@field pending? ParleyComposer.Draft Borrowed editable entry displayed after committed history.
+---@field preview? ParleyInline.Preview Host-resolved independently of reader selection.
 ---@field first integer Validated live source range.
 ---@field last integer
+
+---@class ParleyInline.Preview
+---@field buffer? integer Borrowed draft; an unavailable buffer is displayed, never recreated.
+---@field lines? string[] Borrowed immutable history text.
+---@field role? string
+---@field state string
+---@field created_at? integer
 
 ---@class ParleyInline.Reservation
 ---@field id integer Note whose card is replaced by editor room.
 ---@field row integer
 ---@field lines ParleyNoteLine[]
 ---@field offset integer Display rows preceding the editor room.
+---@field owner? table Borrowing lifetime; stale teardown cannot release a replacement.
 
 ---@class ParleyInline.Row
 ---@field row integer One-based source boundary.
@@ -36,6 +43,7 @@ local api = vim.api
 ---@field rows ParleyInline.Row[]
 ---@field marks table<integer, integer>
 ---@field group? integer Display-only cursor/focus refresh hooks.
+---@field warned_host? boolean One warning per attachment for incompatible cached hosts.
 
 ---@return ParleyInline.View
 function M.open(window)
@@ -46,16 +54,25 @@ end
 
 ---@param view ParleyInline.View
 function M.clear(view)
-    if view.group then
-        api.nvim_del_augroup_by_id(view.group)
-        view.group = nil
-    end
-    if view.buffer and api.nvim_buf_is_loaded(view.buffer) then
-        api.nvim_buf_clear_namespace(view.buffer, view.namespace, 0, -1)
-    end
-    view.buffer = nil
-    view.reservation = nil
+    local group, buffer = view.group, view.buffer
+    view.group, view.buffer, view.reservation = nil, nil, nil
     view.items, view.rows, view.marks = {}, {}, {}
+    local removed, failure = pcall(function()
+        if group then
+            api.nvim_del_augroup_by_id(group)
+        end
+    end)
+    local cleared, err = pcall(function()
+        if buffer and api.nvim_buf_is_loaded(buffer) then
+            api.nvim_buf_clear_namespace(buffer, view.namespace, 0, -1)
+        end
+    end)
+    if not removed then
+        error(failure, 0)
+    end
+    if not cleared then
+        error(err, 0)
+    end
 end
 
 local function card(view, item, budget)
@@ -67,24 +84,26 @@ local function card(view, item, budget)
         and api.nvim_get_current_win() == view.window
         and line >= item.first
         and line <= item.last
-    local preview = item.note
+    local preview = item.preview or item.note
     local text, state, role
-    if item.thread then
+    if item.preview then
         budget = math.min(8, budget)
-        if item.pending then
-            preview = item.pending
-            text = api.nvim_buf_get_lines(item.pending.buffer, 0, -1, false)
-            state = ("draft · %d entries"):format(#item.thread.messages + 1)
-            role = "human"
-        elseif #item.thread.messages > 0 then
-            preview = item.thread.messages[#item.thread.messages]
-            text = preview.lines
-            state = ("%d messages"):format(#item.thread.messages)
-            role = preview.role
+        state, role, text = item.preview.state, item.preview.role, item.preview.lines
+    end
+    -- Presentation reload cannot upgrade a cached host. Refuse its old
+    -- history-bearing item shape rather than guessing a draft or history tip.
+    if not item.preview and rawget(item, "thread") ~= nil then
+        preview, text, state = {}, { "Host preview unavailable" }, "fresh load required"
+    end
+    if preview.buffer then
+        if api.nvim_buf_is_loaded(preview.buffer) then
+            text = api.nvim_buf_get_lines(preview.buffer, 0, -1, false)
+        else
+            text, state = { "Draft buffer unavailable" }, "unavailable draft"
         end
     end
-    if not text then
-        text = api.nvim_buf_get_lines(item.note.buffer, 0, -1, false)
+    text = text or { "" }
+    if not state then
         state = "draft"
         if item.note.saved_lines then
             state = vim.deep_equal(text, item.note.saved_lines) and "saved" or "unsaved edits"
@@ -226,13 +245,26 @@ function M.update(view, buffer, items, selected)
         M.clear(view)
     end
     view.buffer, view.items, view.selected = buffer, items, selected
+    if not view.warned_host then
+        for _, item in ipairs(items) do
+            if rawget(item, "thread") ~= nil and not item.preview then
+                view.warned_host = true
+                vim.notify(
+                    "Parley: cached host lacks resolved previews; start a fresh Neovim session after preserving drafts you need.",
+                    vim.log.levels.WARN
+                )
+                break
+            end
+        end
+    end
     watch_selection(view)
 
     local grouped = {}
     if api.nvim_win_get_width(view.window) >= 24 and api.nvim_win_get_height(view.window) >= 8 then
         for _, item in ipairs(items) do
             if
-                api.nvim_buf_is_loaded(item.note.buffer)
+                item.first >= 1
+                and item.last >= item.first
                 and item.last <= api.nvim_buf_line_count(buffer)
             then
                 grouped[item.last] = grouped[item.last] or {}
@@ -282,16 +314,19 @@ end
 ---@param id integer
 ---@param row integer
 ---@param lines ParleyNoteLine[]
+---@param owner? table Borrowing lifetime, matched on release.
 ---@return integer
-function M.reserve(view, id, row, lines)
-    view.reservation = { id = id, row = row, lines = lines, offset = 0 }
+function M.reserve(view, id, row, lines, owner)
+    view.reservation = { id = id, row = row, lines = lines, offset = 0, owner = owner }
     M.update(view, assert(view.buffer), view.items, view.selected)
     return view.reservation.offset
 end
 
 ---The workspace must validate placements and update after releasing a room.
-function M.release(view)
-    view.reservation = nil
+function M.release(view, owner)
+    if view.reservation and view.reservation.owner == owner then
+        view.reservation = nil
+    end
 end
 
 ---Explicit navigation only. Background rendering never moves the source view.

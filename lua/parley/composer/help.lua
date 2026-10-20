@@ -25,14 +25,6 @@ function M.toggle()
 end
 
 local function keycode(key)
-    key = key:gsub("<([^>]+)>", function(name)
-        if name:lower() == "leader" then
-            return vim.g.mapleader or "\\"
-        elseif name:lower() == "localleader" then
-            return vim.g.maplocalleader or "\\"
-        end
-        return "<" .. name .. ">"
-    end)
     return api.nvim_replace_termcodes(key, true, true, true)
 end
 
@@ -160,11 +152,21 @@ end
 function M.close(footer)
     local window, buffer = footer.window, footer.buffer
     footer.window, footer.buffer, footer.row = nil, nil, nil
-    if window and api.nvim_win_is_valid(window) and api.nvim_win_get_buf(window) == buffer then
-        api.nvim_win_close(window, true)
+    local closed, failure = pcall(function()
+        if window and api.nvim_win_is_valid(window) and api.nvim_win_get_buf(window) == buffer then
+            api.nvim_win_close(window, true)
+        end
+    end)
+    local deleted, err = pcall(function()
+        if buffer and api.nvim_buf_is_valid(buffer) then
+            api.nvim_buf_delete(buffer, { force = true })
+        end
+    end)
+    if not closed then
+        error(failure, 0)
     end
-    if buffer and api.nvim_buf_is_valid(buffer) then
-        api.nvim_buf_delete(buffer, { force = true })
+    if not deleted then
+        error(err, 0)
     end
 end
 

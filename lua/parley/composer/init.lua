@@ -35,6 +35,7 @@ local api = vim.api
 ---@field changed fun() Refresh caller presentation after releasing room.
 ---@field closed? fun(restore: boolean) After teardown; true only for an explicit, focused exit.
 ---@field draft_label? string Optional editing label; no thread/workflow state is owned here.
+---@field managed? boolean Borrower owns geometry; measure/place never call back into its layout.
 
 ---@class ParleyComposer.Mapping
 ---@field name string Composer action; aliases share one footer hint.
@@ -56,11 +57,13 @@ local api = vim.api
 ---@field bindings ParleyComposer.Mapping[] Owned until close, including partial setup.
 ---@field window integer
 ---@field resume_cursor? integer[] Unclamped insertion position, retained until first entry.
----@field group integer
+---@field group? integer Present after hook setup begins.
 ---@field display? table Bounded source/view fingerprint after our last layout.
 ---@field refreshing boolean
 ---@field refresh_pending boolean One coalesced layout/lifecycle check.
 ---@field footer ParleyComposer.HelpFooter Non-focusing help for editors without source room.
+---@field config? table Last allocation; managed help/mode refresh never reallocates room.
+---@field active? boolean Managed selection emphasis, independent of layout.
 
 ---@type ParleyComposer.Editor?
 local current
@@ -121,6 +124,11 @@ function M.owns_source_window(window)
     return current ~= nil and current.source_win == window
 end
 
+---Borrow the current presentation identity for host-owned teardown.
+function M.for_source_window(window)
+    return current and current.source_win == window and current or nil
+end
+
 local function restore_bindings(editor)
     if not api.nvim_buf_is_loaded(editor.note.buffer) then
         return
@@ -130,13 +138,10 @@ local function restore_bindings(editor)
             if binding.installed then
                 local mapping = vim.fn.maparg(binding.key, binding.mode, false, true)
                 local owned = mapping.buffer == 1
+                    and mapping.desc == binding.description
                     and (
                         (type(binding.action) == "function" and mapping.callback == binding.action)
-                        or (
-                            type(binding.action) == "string"
-                            and mapping.rhs == binding.action
-                            and mapping.desc == binding.description
-                        )
+                        or (type(binding.action) == "string" and mapping.rhs == binding.action)
                     )
                 if owned then
                     vim.keymap.del(binding.mode, binding.key, { buffer = editor.note.buffer })
@@ -152,36 +157,61 @@ end
 ---Release only presentation. Closing, interruption and detach never discard text,
 ---rewrite native undo, submit anything, or accept an unfinished local edit.
 ---@param restore? boolean Restore the source view only for an explicit editor exit.
-function M.close(restore)
+---@param expected? ParleyComposer.Editor Ignore stale host teardown of a replacement.
+function M.close(restore, expected)
     local editor = current
-    if not editor then
+    if not editor or (expected ~= nil and editor ~= expected) then
         return
     end
     current = nil
 
-    help.close(editor.footer)
-    api.nvim_del_augroup_by_id(editor.group)
-    api.nvim_set_decoration_provider(assert(display_namespace), {})
-    local focused = api.nvim_get_current_win() == editor.window
+    local failed, failure
+    local function finish(action)
+        local ok, err = pcall(action)
+        if not ok and not failed then
+            failed, failure = true, err
+        end
+    end
+    local focused = api.nvim_win_is_valid(editor.window)
+        and api.nvim_get_current_win() == editor.window
         and api.nvim_win_get_buf(editor.window) == editor.note.buffer
-    remember_cursor(editor)
-    if focused then
-        vim.cmd.stopinsert()
-    end
-
-    restore_bindings(editor)
-
-    if editor.options.room then
-        editor.options.room.release()
-    end
-    -- Restore inactive cards before closing the float triggers focus redraws.
-    editor.options.changed()
-    if
-        api.nvim_win_is_valid(editor.window)
-        and api.nvim_win_get_buf(editor.window) == editor.note.buffer
-    then
-        api.nvim_win_close(editor.window, true)
-    end
+    finish(function()
+        if editor.group then
+            api.nvim_del_augroup_by_id(editor.group)
+        end
+    end)
+    finish(function()
+        api.nvim_set_decoration_provider(assert(display_namespace), {})
+    end)
+    finish(function()
+        remember_cursor(editor)
+    end)
+    finish(function()
+        restore_bindings(editor)
+    end)
+    finish(function()
+        help.close(editor.footer)
+    end)
+    finish(function()
+        if focused and current == nil and api.nvim_get_current_win() == editor.window then
+            vim.cmd.stopinsert()
+        end
+    end)
+    finish(function()
+        if editor.options.room then
+            editor.options.room.release()
+        end
+    end)
+    finish(function()
+        if
+            api.nvim_win_is_valid(editor.window)
+            and api.nvim_win_get_buf(editor.window) == editor.note.buffer
+        then
+            api.nvim_win_close(editor.window, true)
+        end
+    end)
+    -- Host notifications run after mandatory cleanup, even when one fails.
+    finish(editor.options.changed)
     -- Closing normally returns to the source. Honour hooks that instead opened
     -- another editor or moved focus elsewhere; never take their focus back.
     if
@@ -191,10 +221,23 @@ function M.close(restore)
         and source_available(editor)
         and api.nvim_get_current_win() == editor.source_win
     then
-        vim.fn.winrestview(editor.source_view)
+        finish(function()
+            vim.fn.winrestview(editor.source_view)
+        end)
     end
     if editor.options.closed then
-        editor.options.closed(restore == true and focused and current == nil)
+        finish(function()
+            editor.options.closed(
+                restore == true
+                    and focused
+                    and current == nil
+                    and source_available(editor)
+                    and api.nvim_get_current_win() == editor.source_win
+            )
+        end)
+    end
+    if failed then
+        error(failure, 0)
     end
 end
 
@@ -262,6 +305,21 @@ local function footer_row(editor, width)
     end
 end
 
+local function present_help(editor, config)
+    local footer = footer_row(editor, config.width)
+    if footer then
+        help.present(editor.footer, footer, {
+            relative = "win",
+            win = editor.source_win,
+            row = config.row + config.height + (config.border == "rounded" and 2 or 0),
+            col = config.col + 1,
+            width = config.width,
+        })
+    else
+        help.close(editor.footer)
+    end
+end
+
 local function geometry(editor, reveal)
     local first, last = editor.options.first, editor.options.last
     local presentation_room = editor.options.room
@@ -277,7 +335,6 @@ local function geometry(editor, reveal)
     if not first or not last or not presentation_room then
         local width = math.min(100, window_width - 8)
         api.nvim_win_set_config(editor.window, { width = width })
-        local footer = footer_row(editor, width)
         local available = window_height - 4
         local rows = api.nvim_win_text_height(editor.window, {
             start_row = 0,
@@ -295,8 +352,7 @@ local function geometry(editor, reveal)
             border = "rounded",
             hide = false,
             title = " You · " .. editor.options.source_label .. " · unplaced ",
-        },
-            footer
+        }
     end
 
     -- Do not paint an editor over another plugin's virtual text/display editor.
@@ -341,7 +397,6 @@ local function geometry(editor, reveal)
     -- Active prose grows to its wrapped content, bounded only by the viewport.
     -- Inactive card truncation belongs to the caller, not this editing window.
     local content_height = math.min(math.max(1, content_rows), available)
-    local footer = footer_row(editor, width)
     local function reserve_room()
         local room = {}
         for _ = 1, content_height + #heading + 2 do
@@ -351,10 +406,6 @@ local function geometry(editor, reveal)
             room[index + 1] = style.card_line(indent, width, padding, {
                 { text, "ParleyReviewNoteHeading" },
             }, true)
-        end
-        -- Reuse bottom padding: help never takes space away from the message.
-        if footer then
-            room[#room] = style.footer_line(indent, width, padding, footer)
         end
         return presentation_room.reserve(last, room)
     end
@@ -431,6 +482,50 @@ local function hide_editor_gutter(window)
     vim.wo[window].foldcolumn = "0"
 end
 
+---Measure a borrowed editor without selecting, focusing or reserving source room.
+---@param editor ParleyComposer.Editor
+---@param width integer
+---@param maximum integer
+---@return integer?
+function M.measure(editor, width, maximum)
+    if current ~= editor or not editor_available(editor) then
+        return
+    end
+    hide_editor_gutter(editor.window)
+    api.nvim_win_set_config(editor.window, { width = width })
+    return math.max(
+        1,
+        math.min(
+            maximum,
+            api.nvim_win_text_height(editor.window, {
+                start_row = 0,
+                end_row = api.nvim_buf_line_count(editor.note.buffer) - 1,
+                max_height = maximum,
+            }).all
+        )
+    )
+end
+
+---Consume an allocation. The discussion owns its header/padding/source room.
+---@param editor ParleyComposer.Editor
+---@param config table
+---@param active? boolean Managed selection emphasis; defaults to true.
+function M.place(editor, config, active)
+    if current ~= editor or not editor_available(editor) then
+        return
+    end
+    hide_editor_gutter(editor.window)
+    api.nvim_win_set_config(editor.window, config)
+    editor.config, editor.active = config, active ~= false
+    local body = editor.active and "ParleyReviewNoteActive" or "ParleyReviewNote"
+    vim.wo[editor.window].winhighlight = ("Normal:%s,NormalFloat:%s,EndOfBuffer:%s"):format(
+        body,
+        body,
+        body
+    )
+    present_help(editor, config)
+end
+
 local function refresh(editor, reveal)
     if current ~= editor then
         return
@@ -445,20 +540,17 @@ local function refresh(editor, reveal)
     -- callback must not leave an inert editor marked as permanently refreshing.
     local laid_out, result = pcall(function()
         hide_editor_gutter(editor.window)
-        local config, footer = geometry(editor, reveal)
+        if editor.options.managed then
+            if editor.config then
+                M.place(editor, editor.config, editor.active)
+            end
+            return true
+        end
+        local config = geometry(editor, reveal)
         if config and current == editor then
             api.nvim_win_set_config(editor.window, config)
-            if footer then
-                help.present(editor.footer, footer, {
-                    relative = "win",
-                    win = editor.source_win,
-                    row = config.row + config.height + 2,
-                    col = config.col + 1,
-                    width = config.width,
-                })
-            else
-                help.close(editor.footer)
-            end
+            editor.config = config
+            present_help(editor, config)
             editor.display = display_signature(editor)
         end
         return config
@@ -471,7 +563,7 @@ local function refresh(editor, reveal)
         return
     end
     if not laid_out then
-        M.close(false)
+        pcall(M.close, false)
         error(result, 0)
     end
     if not result then
@@ -509,7 +601,7 @@ end
 
 local function invalidate_display()
     local editor = current
-    if not editor or editor.refreshing or editor.refresh_pending then
+    if not editor or editor.options.managed or editor.refreshing or editor.refresh_pending then
         return
     end
     if
@@ -553,7 +645,13 @@ function M.toggle_help()
         return
     end
     help.toggle()
-    refresh(editor, false)
+    if editor.config then
+        local shown, failure = pcall(present_help, editor, editor.config)
+        if not shown then
+            pcall(help.close, editor.footer)
+            error(failure, 0)
+        end
+    end
 end
 
 local function install_bindings(editor)
@@ -564,9 +662,11 @@ local function install_bindings(editor)
                 editor.bindings[#editor.bindings + 1] = {
                     name = name,
                     mode = mode,
-                    key = key,
+                    key = keymaps.concrete(key),
                     action = action,
-                    description = description,
+                    -- String RHS mappings have no callback identity; the
+                    -- window lifetime makes their ownership equally concrete.
+                    description = description .. " · Parley composer " .. editor.window,
                     installed = false,
                 }
             end
@@ -647,7 +747,9 @@ local function install_hooks(editor)
             end
             if event.buf == editor.note.buffer and event.event:match("^TextChanged") then
                 remember_cursor(editor)
-                schedule_refresh(editor)
+                if not editor.options.managed then
+                    schedule_refresh(editor)
+                end
             else
                 invalidate_display()
             end
@@ -657,6 +759,9 @@ local function install_hooks(editor)
         group = editor.group,
         pattern = display_options,
         callback = function()
+            if editor.options.managed then
+                return
+            end
             if api.nvim_get_current_win() == editor.window then
                 schedule_refresh(editor)
             else
@@ -681,9 +786,9 @@ local function install_hooks(editor)
 end
 
 ---@return boolean entered
-function M.enter()
+function M.enter(expected)
     local editor = current
-    if not editor then
+    if not editor or (expected ~= nil and editor ~= expected) then
         return false
     end
     local window = api.nvim_get_current_win()
@@ -698,52 +803,64 @@ function M.enter()
     -- Entering may run configuration hooks that change the source window's
     -- gutter or winbar. Finalize that layout as part of this explicit action,
     -- rather than treating our own focus transfer as an external interruption.
-    editor.refreshing = true
-    api.nvim_set_current_win(editor.window)
-    if current ~= editor or api.nvim_get_current_win() ~= editor.window then
-        editor.refreshing = false
-        return false
-    end
-    -- Apply after WinEnter/BufEnter hooks so source-window number settings
-    -- cannot leak into the composer when it receives focus.
-    hide_editor_gutter(editor.window)
-    local insertion_cursor = editor.resume_cursor
-    if insertion_cursor then
-        api.nvim_win_set_cursor(editor.window, insertion_cursor)
-    else
-        insertion_cursor = api.nvim_win_get_cursor(editor.window)
-    end
-    refresh(editor, true)
-    if current ~= editor or api.nvim_get_current_win() ~= editor.window then
-        return false
-    end
+    local entered, result = pcall(function()
+        editor.refreshing = true
+        api.nvim_set_current_win(editor.window)
+        if current ~= editor or api.nvim_get_current_win() ~= editor.window then
+            editor.refreshing = false
+            return false
+        end
+        -- Apply after WinEnter/BufEnter hooks so source-window number settings
+        -- cannot leak into the composer when it receives focus.
+        hide_editor_gutter(editor.window)
+        local insertion_cursor = editor.resume_cursor
+        if insertion_cursor then
+            api.nvim_win_set_cursor(editor.window, insertion_cursor)
+        else
+            insertion_cursor = api.nvim_win_get_cursor(editor.window)
+        end
+        refresh(editor, true)
+        if current ~= editor or api.nvim_get_current_win() ~= editor.window then
+            return false
+        end
 
-    -- A saved Insert-mode cursor can sit after the final byte. Restoring it
-    -- in Normal mode clamps it onto the last character, so resume with A only
-    -- for that boundary; i preserves insertion positions within the line.
-    local line = api.nvim_buf_get_lines(
-        editor.note.buffer,
-        insertion_cursor[1] - 1,
-        insertion_cursor[1],
-        false
-    )[1]
-    editor.resume_cursor = nil
-    vim.cmd(insertion_cursor[2] >= #line and "startinsert!" or "startinsert")
-    return true
+        -- A saved Insert-mode cursor can sit after the final byte. Restoring it
+        -- in Normal mode clamps it onto the last character, so resume with A only
+        -- for that boundary; i preserves insertion positions within the line.
+        local line = api.nvim_buf_get_lines(
+            editor.note.buffer,
+            insertion_cursor[1] - 1,
+            insertion_cursor[1],
+            false
+        )[1]
+        editor.resume_cursor = nil
+        vim.cmd(insertion_cursor[2] >= #line and "startinsert!" or "startinsert")
+        return true
+    end)
+    editor.refreshing = false
+    if not entered then
+        pcall(M.close, false, editor)
+        error(result, 0)
+    end
+    return result
 end
 
 ---@param note ParleyComposer.Draft Borrowed caller-owned buffer/history.
 ---@param options ParleyComposer.Presentation Borrowed until close.
+---@return ParleyComposer.Editor? editor Borrowed identity for measure/place/close, not a buffer owner.
 function M.show(note, options)
     local configured_keys = keymaps.resolve_composer(options.keymaps)
     M.close(false)
+    if current ~= nil then
+        return
+    end
     if not api.nvim_buf_is_loaded(note.buffer) then
         vim.notify("Parley: draft buffer was unloaded or deleted externally", vim.log.levels.WARN)
         return
     end
     display_namespace = display_namespace or api.nvim_create_namespace(module_path .. ".display")
     local source_buffer = api.nvim_win_get_buf(options.source_win)
-    local source_view = vim.fn.winsaveview()
+    local source_view = api.nvim_win_call(options.source_win, vim.fn.winsaveview)
     local window = api.nvim_open_win(note.buffer, false, {
         relative = "win",
         win = options.source_win,
@@ -768,8 +885,7 @@ function M.show(note, options)
         source_tick = api.nvim_buf_get_changedtick(source_buffer),
         source_view = source_view,
         window = window,
-        resume_cursor = entry_cursor(note),
-        group = api.nvim_create_augroup(module_path, { clear = true }),
+        resume_cursor = nil,
         -- Hooks must not invalidate an editor before its first layout exists.
         refreshing = true,
         refresh_pending = false,
@@ -780,6 +896,8 @@ function M.show(note, options)
     -- Once the float exists, setup failures release presentation and propagate;
     -- the caller-owned draft/undo buffer is never part of cleanup.
     local initialized, failure = pcall(function()
+        editor.group = api.nvim_create_augroup(module_path, { clear = true })
+        editor.resume_cursor = entry_cursor(note)
         style.refresh()
         -- Format the retained buffer in place, including drafts opened earlier.
         -- Use Neovim's Markdown support; no renderer dependency is required.
@@ -798,17 +916,22 @@ function M.show(note, options)
         api.nvim_win_set_cursor(window, editor.resume_cursor)
         install_bindings(editor)
         install_hooks(editor)
-        refresh(editor, true)
+        if not options.managed then
+            refresh(editor, true)
+        else
+            editor.refreshing = false
+        end
         if current == editor and options.enter then
             M.enter()
         end
     end)
     if not initialized then
         if current == editor then
-            M.close(false)
+            pcall(M.close, false)
         end
         error(failure, 0)
     end
+    return current == editor and editor or nil
 end
 
 return M

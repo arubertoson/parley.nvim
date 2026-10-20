@@ -72,6 +72,22 @@ function M.resolve(defaults, overrides)
     return resolved
 end
 
+---Freeze leader expansion at installation, not at teardown or help rendering.
+---@param key string
+---@return string
+function M.concrete(key)
+    return (
+        key:gsub("<([^>]+)>", function(name)
+            if name:lower() == "leader" then
+                return vim.g.mapleader or "\\"
+            elseif name:lower() == "localleader" then
+                return vim.g.maplocalleader or "\\"
+            end
+            return "<" .. name .. ">"
+        end)
+    )
+end
+
 ---@param overrides? ParleyComposer.Keymaps|false
 ---@return table<string, string[]> keys Fresh normalized composer keys.
 function M.resolve_composer(overrides)

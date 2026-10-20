@@ -58,17 +58,18 @@ local heading_namespace
 ---@field options ParleyDiscussion.Options
 ---@field state ParleyDiscussion.State
 ---@field parent? ParleyDiscussion.Reader Independently scrollable exact-parent context.
----@field group integer
+---@field group? integer Present after setup begins.
 ---@field source_buf integer
 ---@field source_tick integer
 ---@field source_view table
 ---@field closed boolean
 ---@field composing boolean
 ---@field draft? ParleyDiscussion.Draft
----@field draft_room? ParleyNoteLine[]
+---@field editor? ParleyComposer.Editor Borrowed presentation identity, never a draft owner.
 ---@field render_mode? 'expanded'|'collapsed'
 ---@field pending boolean
 ---@field refreshing boolean
+---@field emphasized? boolean Last attachment/focus emphasis, not remembered selection.
 
 local defaults = {
     next_message = "<C-n>",
@@ -112,9 +113,6 @@ end
 local function get_entry(data, options, id)
     local draft = options.draft()
     if draft and id == draft.entry_id then
-        if not api.nvim_buf_is_loaded(draft.buffer) then
-            return nil, draft
-        end
         return {
             id = draft.entry_id,
             parent_id = draft.parent_id,
@@ -122,7 +120,9 @@ local function get_entry(data, options, id)
             author = "You",
             origin = "editor/draft",
             created_at = draft.created_at,
-            lines = api.nvim_buf_get_lines(draft.buffer, 0, -1, false),
+            lines = api.nvim_buf_is_loaded(draft.buffer)
+                    and api.nvim_buf_get_lines(draft.buffer, 0, -1, false)
+                or { "Draft buffer unavailable" },
         },
             draft
     end
@@ -141,12 +141,23 @@ local function entry_ids(data, options)
     return ids
 end
 
-local function selected_message(view)
-    if view.composing and view.draft then
-        local id = view.draft.replaces_id or view.draft.parent_id
-        return id and thread.get(view.thread, id) or nil
+-- One projection for both reading and editing: the selected entry and only its
+-- exact parent. A revision's replaces_id is identity, never alternate context.
+local function projection(view)
+    local selected, draft = get_entry(view.thread, view.options, view.state.selected_id)
+    local parent = selected and selected.parent_id and thread.get(view.thread, selected.parent_id)
+    if view.state.collapsed and not view.composing then
+        parent = nil
     end
-    return get_entry(view.thread, view.options, view.state.selected_id)
+    local ids = entry_ids(view.thread, view.options)
+    local index = 0
+    for position, id in ipairs(ids) do
+        if selected and id == selected.id then
+            index = position
+            break
+        end
+    end
+    return { selected = selected, draft = draft, parent = parent, index = index, count = #ids }
 end
 
 local function remember_reader(view, reader)
@@ -162,7 +173,7 @@ local function remember_reader(view, reader)
 end
 
 local function remember_position(view)
-    if view.render_mode == "expanded" then
+    if not view.composing and view.render_mode == "expanded" then
         remember_reader(view, view)
     end
     remember_reader(view, view.parent)
@@ -172,14 +183,24 @@ local function close_reader(reader)
     if not reader then
         return
     end
-    if
-        api.nvim_win_is_valid(reader.window)
-        and api.nvim_win_get_buf(reader.window) == reader.buffer
-    then
-        api.nvim_win_close(reader.window, true)
+    local closed, failure = pcall(function()
+        if
+            api.nvim_win_is_valid(reader.window)
+            and api.nvim_win_get_buf(reader.window) == reader.buffer
+        then
+            api.nvim_win_close(reader.window, true)
+        end
+    end)
+    local deleted, err = pcall(function()
+        if api.nvim_buf_is_valid(reader.buffer) then
+            api.nvim_buf_delete(reader.buffer, { force = true })
+        end
+    end)
+    if not closed then
+        error(failure, 0)
     end
-    if api.nvim_buf_is_valid(reader.buffer) then
-        api.nvim_buf_delete(reader.buffer, { force = true })
+    if not deleted then
+        error(err, 0)
     end
 end
 
@@ -190,26 +211,62 @@ function M.close(view, restore)
     if not view or view.closed then
         return
     end
-    remember_position(view)
     local focused = api.nvim_get_current_win() == view.window
         or (view.parent and api.nvim_get_current_win() == view.parent.window)
     view.closed = true
-    api.nvim_del_augroup_by_id(view.group)
-    if view.composing and composer.owns_source_window(view.options.source_win) then
-        composer.close(false)
+    local failed, failure
+    local function finish(action)
+        local ok, err = pcall(action)
+        if not ok and not failed then
+            failed, failure = true, err
+        end
     end
-    view.options.room.release()
-    close_reader(view.parent)
-    close_reader(view)
-    view.options.changed()
+    finish(function()
+        if view.group then
+            api.nvim_del_augroup_by_id(view.group)
+        end
+    end)
+    finish(function()
+        remember_position(view)
+    end)
+    if view.editor then
+        finish(function()
+            composer.close(false, view.editor)
+        end)
+    end
+    finish(view.options.room.release)
+    finish(function()
+        close_reader(view.parent)
+    end)
+    finish(function()
+        close_reader(view)
+    end)
+    finish(view.options.changed)
     if
         restore
         and focused
         and source_available(view)
         and api.nvim_get_current_win() == view.options.source_win
     then
-        vim.fn.winrestview(view.source_view)
+        finish(function()
+            vim.fn.winrestview(view.source_view)
+        end)
     end
+    if failed then
+        error(failure, 0)
+    end
+end
+
+local function attachment_active(view)
+    local focused = api.nvim_get_current_win()
+    if focused == view.options.source_win then
+        local line = api.nvim_win_get_cursor(focused)[1]
+        return line >= view.options.first and line <= view.options.last
+    end
+    return focused == view.window
+        or (view.parent and focused == view.parent.window)
+        or (view.editor and focused == view.editor.window)
+        or false
 end
 
 local function configure_window(reader, parent)
@@ -222,7 +279,8 @@ local function configure_window(reader, parent)
     vim.wo[window].foldenable = false
     vim.wo[window].wrap = true
     vim.wo[window].linebreak = true
-    local body = parent and "ParleyReviewNote" or "ParleyReviewNoteActive"
+    local active = not parent and attachment_active(reader)
+    local body = active and "ParleyReviewNoteActive" or "ParleyReviewNote"
     vim.wo[window].winhighlight = ("Normal:%s,NormalFloat:%s,EndOfBuffer:%s"):format(
         body,
         body,
@@ -250,11 +308,10 @@ end
 -- Context is a full native reader, not a shortened virtual-text preview.
 -- Both readers use the same line coordinates so selecting a parent, replying,
 -- and returning to a draft can reuse that message's retained reading view.
-local function render_parent(view, width)
-    local message = selected_message(view)
-    local parent = message and message.parent_id and thread.get(view.thread, message.parent_id)
+local function render_parent(view, width, resolved)
+    local parent = resolved.parent
     local reader = view.parent
-    if not parent or (view.state.collapsed and not view.composing) then
+    if not parent then
         reader.rendered_id = nil
         api.nvim_win_set_config(reader.window, { hide = true })
         return
@@ -271,20 +328,12 @@ local function render_parent(view, width)
     return parent
 end
 
-local function render(view, width)
-    local message, draft = selected_message(view)
-    local ids = entry_ids(view.thread, view.options)
-    local count, index = #ids, 0
-    for position, id in ipairs(ids) do
-        if message and id == message.id then
-            index = position
-            break
-        end
-    end
+local function render(view, width, resolved)
+    local message, draft = resolved.selected, resolved.draft
     local label = message and message.role == "agent" and "Agent" or "You"
     local heading = style.heading(
         message or {},
-        (draft and "draft · %d/%d" or "read-only · %d/%d"):format(index, count),
+        (draft and "draft · %d/%d" or "read-only · %d/%d"):format(resolved.index, resolved.count),
         view.options.first,
         view.options.last,
         width,
@@ -305,11 +354,8 @@ local function render(view, width)
     view.rendered_id = message and message.id or nil
 end
 
--- The full parent and selected reader share a bounded source-window budget.
--- Short cards lend unused room to the other; long cards scroll independently.
--- Composing keeps the selected reader expanded at the same bounded height,
--- with its reading position intact; the reply uses the remaining viewport.
--- These are display budgets, never truncation of canonical text or draft text.
+-- Resolve once, measure the two slots, allocate the viewport, reserve source
+-- room, then apply geometry. The borrowed composer never calls this layout.
 local function layout(view, reveal)
     local options = view.options
     local height = api.nvim_win_get_height(options.source_win)
@@ -338,34 +384,58 @@ local function layout(view, reveal)
             return
         end
     end
+
+    local resolved = projection(view)
+    local active = attachment_active(view)
+    view.emphasized = active
     local indent, width, padding = style.layout(options.source_win)
     api.nvim_win_set_config(view.window, { width = width })
     api.nvim_win_set_config(view.parent.window, { width = width })
-    local parent = render_parent(view, width)
-    render(view, width)
+    render_parent(view, width, resolved)
+    render(view, width, resolved)
     configure_window(view)
     configure_window(view.parent, true)
-    -- Two padding rows per card and one neutral row between cards.
-    local maximum = math.max(parent and 4 or 2, math.floor(height / 2) - (parent and 5 or 2))
+
+    local parent = resolved.parent
+    local below = options.last < api.nvim_buf_line_count(view.source_buf) and 1 or 0
+    local overhead = (view.composing and 3 or 2) + (parent and 3 or 0)
+    local minimum = parent and 3 or 1
+    local budget = (view.composing and height - 1 - below or math.floor(height / 2)) - overhead
+    if budget < minimum then
+        return
+    end
     local function text_height(reader)
-        return math.min(
-            maximum,
-            api.nvim_win_text_height(reader.window, {
-                start_row = 0,
-                end_row = api.nvim_buf_line_count(reader.buffer) - 1,
-                max_height = maximum,
-            }).all
+        return math.max(
+            1,
+            math.min(
+                budget,
+                api.nvim_win_text_height(reader.window, {
+                    start_row = 0,
+                    end_row = api.nvim_buf_line_count(reader.buffer) - 1,
+                    max_height = budget,
+                }).all
+            )
         )
     end
-    local desired = text_height(view)
-    view.height = desired
-    if parent then
-        view.height = math.min(desired, math.ceil(maximum / 2))
-        view.parent.height = math.min(text_height(view.parent), maximum - view.height)
-        view.height = math.min(desired, maximum - view.parent.height)
+    local desired
+    if view.composing then
+        desired = composer.measure(view.editor, width, budget)
+    else
+        desired = text_height(view)
     end
-    local message = selected_message(view)
-    local role = message and message.role or "human"
+    if not desired then
+        return
+    end
+    local parent_desired = parent and text_height(view.parent) or 0
+    local function allocate()
+        local parent_height = parent
+                and math.min(parent_desired, math.max(2, math.floor(budget / 3)))
+            or 0
+        view.height = math.min(desired, budget - parent_height)
+        view.parent.height = parent and math.min(parent_desired, budget - view.height) or 0
+    end
+    allocate()
+
     local function reserve()
         local room = {}
         if parent then
@@ -382,20 +452,20 @@ local function layout(view, reveal)
             end
             room[#room + 1] = { { "", "Normal" } }
         end
-        for _ = 1, view.height + 2 do
-            room[#room + 1] = style.card_line(indent, width, padding, {}, true, role)
+        local role = resolved.selected and resolved.selected.role or "human"
+        local first = #room + 1
+        for _ = 1, view.height + (view.composing and 3 or 2) do
+            room[#room + 1] = style.card_line(indent, width, padding, {}, active, role)
         end
         if view.composing then
-            -- Separate the immutable reader from the editable reply card.
-            room[#room + 1] = { { "", "Normal" } }
+            room[first + 1] = style.card_line(indent, width, padding, {
+                { view.rendered[1], "ParleyReviewNoteHeading" },
+            }, active, role)
         end
-        for _, line in ipairs(view.draft_room or {}) do
-            room[#room + 1] = line
-        end
-        return options.room.reserve(options.last, room) + (parent and view.parent.height + 3 or 0)
+        return options.room.reserve(options.last, room)
     end
     local preceding = reserve()
-    local config
+    local row
     api.nvim_win_call(options.source_win, function()
         if reveal then
             api.nvim_win_set_cursor(options.source_win, { options.last, 0 })
@@ -415,60 +485,75 @@ local function layout(view, reveal)
                 max_height = height + 1,
             }).all + position.topfill + preceding
         end
-        local below = options.last < api.nvim_buf_line_count(view.source_buf) and 1 or 0
-        local row = source_row()
-        if reveal and (not row or row + view.height + 2 + below > height) then
+        row = source_row()
+        local function room_height()
+            return view.height + view.parent.height + overhead
+        end
+        if reveal and (not row or row + room_height() + below > height) then
             vim.cmd("normal! zt")
             row = source_row()
         end
-        while row and view.height > height - row - 2 - below do
-            local overflow = row + view.height + 2 + below - height
-            if view.height > 2 then
-                view.height = math.max(2, view.height - overflow)
-            elseif parent and view.parent.height > 2 then
-                view.parent.height = math.max(2, view.parent.height - overflow)
-            else
+        while row and row + room_height() + below > height do
+            local remaining = budget - (row + room_height() + below - height)
+            if remaining < minimum then
+                row = nil
                 return
             end
+            budget = remaining
+            allocate()
             preceding = reserve()
             row = source_row()
         end
-        if row then
-            config = {
-                relative = "win",
-                win = options.source_win,
-                row = row + 1,
-                col = indent,
-                width = width,
-                height = view.height,
-                hide = false,
-                border = "none",
-            }
-        end
     end)
-    if config then
-        api.nvim_win_set_config(view.window, config)
-        if parent then
-            api.nvim_win_set_config(
-                view.parent.window,
-                vim.tbl_extend("force", config, {
-                    row = config.row - view.parent.height - 3,
-                    height = view.parent.height,
-                    focusable = not view.composing,
-                })
-            )
+    if not row then
+        return
+    end
+
+    local config = {
+        relative = "win",
+        win = options.source_win,
+        row = row + (parent and view.parent.height + 3 or 0) + 1,
+        col = indent,
+        width = width,
+        height = view.height,
+        hide = false,
+        border = "none",
+    }
+    api.nvim_win_set_config(view.window, view.composing and { hide = true } or config)
+    if parent then
+        api.nvim_win_set_config(
+            view.parent.window,
+            vim.tbl_extend("force", config, {
+                row = row + 1,
+                height = view.parent.height,
+                focusable = true,
+            })
+        )
+    end
+    if view.composing then
+        composer.place(
+            view.editor,
+            vim.tbl_extend("force", config, { row = config.row + 1 }),
+            active
+        )
+    end
+    return true
+end
+
+-- Navigation restoration belongs to explicit transitions, never geometry.
+local function restore_position(view)
+    for _, reader in ipairs({ view, view.parent }) do
+        if
+            reader.rendered_id
+            and (reader ~= view or (not view.composing and not view.state.collapsed))
+        then
+            api.nvim_win_call(reader.window, function()
+                vim.fn.winrestview(
+                    view.state.positions[reader.rendered_id]
+                        or { lnum = 1, col = 0, topline = 1, topfill = 0 }
+                )
+            end)
         end
-        for _, reader in ipairs({ view, view.parent }) do
-            if reader.rendered_id and (reader ~= view or view.render_mode == "expanded") then
-                api.nvim_win_call(reader.window, function()
-                    vim.fn.winrestview(
-                        view.state.positions[reader.rendered_id]
-                            or { lnum = 1, col = 0, topline = 1, topfill = 0 }
-                    )
-                end)
-            end
-        end
-        return preceding
     end
 end
 
@@ -482,16 +567,15 @@ function M.update(view)
         M.close(view, false)
         return
     end
-    remember_position(view)
     view.refreshing = true
     local ok, result = pcall(layout, view, false)
     view.refreshing = false
     if not ok or result == nil then
-        M.close(view, false)
         if not ok then
+            pcall(M.close, view, false)
             error(result, 0)
         end
-        return
+        M.close(view, false)
     end
 end
 
@@ -518,12 +602,14 @@ function M.select(view, id)
     local ok, result = pcall(layout, view, false)
     view.refreshing = false
     if not ok or result == nil then
-        M.close(view, false)
         if not ok then
+            pcall(M.close, view, false)
             error(result, 0)
         end
+        M.close(view, false)
         return false
     end
+    restore_position(view)
     return true
 end
 
@@ -554,9 +640,11 @@ function M.toggle(view)
     end
     remember_position(view)
     view.state.collapsed = not view.state.collapsed
-    -- Folding has already captured the full reading view; don't replace it
-    -- with the two-row collapsed view when expanding again.
+    -- Folding captures the outgoing view; geometry never restores it.
     M.update(view)
+    if not view.closed then
+        restore_position(view)
+    end
 end
 
 -- The composer borrows the same host buffer on every entry. Save/close selects
@@ -574,82 +662,89 @@ local function compose(view, draft)
         vim.notify("Parley: retained draft was deleted externally", vim.log.levels.WARN)
         return false
     end
+
     remember_position(view)
+    view.state.selected_id = draft.entry_id
+    view.state.collapsed = false
     view.draft, view.composing = draft, true
-    M.update(view)
-    if view.closed then
-        return false
-    end
-    api.nvim_set_current_win(view.options.source_win)
-    if not display_available(view) or api.nvim_get_current_win() ~= view.options.source_win then
-        view.composing = false
-        M.update(view)
-        return false
-    end
-    local opened, failure = pcall(composer.show, draft, {
-        source_win = view.options.source_win,
-        first = view.options.first,
-        last = view.options.last,
-        source_label = view.options.source_label,
-        keymaps = view.options.composer_keymaps,
-        draft_label = draft.replaces_id and "editing revision" or "editing reply",
-        enter = true,
-        room = {
-            namespace = view.options.room.namespace,
-            reserve = function(_, lines)
-                view.draft_room = lines
-                -- This layout is entered by the composer, not M.update. Guard
-                -- our option/window hooks too, so the two views cannot keep
-                -- scheduling each other after a healthy refresh.
-                local refreshing = view.refreshing
-                view.refreshing = true
-                local ok, preceding = pcall(layout, view, false)
-                view.refreshing = refreshing
-                if not ok then
-                    error(preceding, 0)
+    view.refreshing = true
+    local opened, failure = pcall(function()
+        api.nvim_set_current_win(view.options.source_win)
+        if
+            not display_available(view)
+            or api.nvim_get_current_win() ~= view.options.source_win
+        then
+            return
+        end
+        local editor
+        editor = composer.show(draft, {
+            source_win = view.options.source_win,
+            first = view.options.first,
+            last = view.options.last,
+            source_label = view.options.source_label,
+            keymaps = view.options.composer_keymaps,
+            managed = true,
+            changed = function()
+                if view.closed or view.draft ~= draft then
+                    return
                 end
-                assert(preceding ~= nil, "Parley: discussion placement is no longer available")
-                -- Include both reader padding rows and the neutral separator.
-                return preceding + view.height + 3
-            end,
-            release = function()
-                view.draft_room = nil
-            end,
-        },
-        changed = function()
-            view.composing = false
-            view.state.selected_id = draft.entry_id
-            view.state.collapsed = false
-            view.state.positions[draft.entry_id] = view.state.positions[draft.entry_id]
-                or { lnum = 1, col = 0, topline = 1, topfill = 0 }
-            if not view.closed then
+                view.composing, view.editor = false, nil
                 M.update(view)
+                if not view.closed then
+                    restore_position(view)
+                end
+            end,
+            closed = function(restore)
+                if
+                    restore
+                    and display_available(view)
+                    and api.nvim_get_current_win() == view.options.source_win
+                then
+                    api.nvim_set_current_win(view.window)
+                    if display_available(view) and api.nvim_get_current_win() == view.window then
+                        configure_window(view)
+                    end
+                end
+            end,
+            navigate = function(step)
+                if display_available(view) and api.nvim_get_current_win() == view.window then
+                    M.move(view, step)
+                end
+            end,
+        })
+        view.editor = editor
+        if view.closed then
+            if editor then
+                composer.close(false, editor)
             end
-        end,
-        closed = function(restore)
-            if
-                restore
-                and display_available(view)
-                and api.nvim_get_current_win() == view.options.source_win
-            then
-                api.nvim_set_current_win(view.window)
-                configure_window(view)
-            end
-        end,
-        navigate = function(step)
-            -- The composer has already retained the draft and restored this
-            -- reader. Navigate its entries, never another source attachment.
-            if display_available(view) and api.nvim_get_current_win() == view.window then
-                M.move(view, step)
-            end
-        end,
-    })
+            return
+        end
+        assert(editor, "Parley: composer was interrupted while opening")
+        assert(layout(view, true), "Parley: no unobscured discussion space at its source")
+        restore_position(view)
+        if not composer.enter(editor) then
+            composer.close(false, editor)
+        end
+    end)
+    view.refreshing = false
     if not opened then
-        view.composing, view.draft_room = false, nil
-        M.update(view)
+        -- Cleanup cannot replace the original opening failure.
+        if view.editor then
+            pcall(composer.close, false, view.editor)
+        end
+        view.composing, view.editor = false, nil
+        if not view.closed then
+            pcall(M.update, view)
+        end
         error(failure, 0)
     end
-    return view.composing and composer.owns_source_window(view.options.source_win)
+    if not view.editor then
+        view.composing = false
+        if not view.closed then
+            M.update(view)
+        end
+    end
+    return not view.closed and view.composing
 end
 
 ---Reply to committed history or resume the selected draft. A draft cannot
@@ -796,7 +891,6 @@ function M.open(data, options)
         state = state,
         buffer = buffer,
         window = window,
-        group = api.nvim_create_augroup("ParleyDiscussion" .. buffer, { clear = true }),
         source_buf = source_buffer,
         source_tick = api.nvim_buf_get_changedtick(source_buffer),
         source_view = source_view,
@@ -807,6 +901,7 @@ function M.open(data, options)
         refreshing = true,
     }
     local initialized, failure = pcall(function()
+        view.group = api.nvim_create_augroup("ParleyDiscussion" .. buffer, { clear = true })
         style.refresh()
         view.parent = create_reader(options.source_win)
         for _, display in ipairs({ view, view.parent }) do
@@ -874,6 +969,7 @@ function M.open(data, options)
             end
         end
         assert(layout(view, true) ~= nil, "Parley: no unobscured discussion space at its source")
+        restore_position(view)
         api.nvim_create_autocmd({
             "WinEnter",
             "BufEnter",
@@ -883,6 +979,8 @@ function M.open(data, options)
             "VimResized",
             "TextChanged",
             "TextChangedI",
+            "TextChangedP",
+            "ModeChanged",
         }, {
             group = view.group,
             callback = function()
@@ -898,10 +996,23 @@ function M.open(data, options)
                 end,
             })
         end
+        api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+            group = view.group,
+            callback = function()
+                if attachment_active(view) ~= view.emphasized then
+                    schedule_update(view)
+                end
+            end,
+        })
         api.nvim_create_autocmd("WinScrolled", {
             group = view.group,
             callback = function(event)
-                if event.match == tostring(options.source_win) then
+                if
+                    event.match == tostring(view.window)
+                    or event.match == tostring(view.parent.window)
+                then
+                    remember_position(view)
+                elseif event.match == tostring(options.source_win) then
                     schedule_update(view)
                 end
             end,
@@ -926,7 +1037,7 @@ function M.open(data, options)
     end)
     view.refreshing = false
     if not initialized then
-        M.close(view, false)
+        pcall(M.close, view, false)
         error(failure, 0)
     end
     return view

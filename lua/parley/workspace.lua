@@ -5,6 +5,7 @@
 local config = require("parley.config")
 local composer = require("parley.composer")
 local inline = require("parley.inline")
+local keys = require("parley.composer.keymaps")
 local style = require("parley.composer.style")
 local M = {}
 local api = vim.api
@@ -39,6 +40,7 @@ local api = vim.api
 ---@field bindings ParleyWorkspace.Keymap[] Keys installed for this activation.
 ---@field maps table<integer, table[]> Original mapping overrides by visited file buffer.
 ---@field views table<integer, ParleyInline.View> Owned source-window presentation.
+---@field editor? ParleyComposer.Editor Exact owned presentation, even after another source is visited.
 ---@field selection? { window: integer, buffer: integer, line: integer }
 ---@field refresh_pending? boolean
 
@@ -251,7 +253,19 @@ local function show(review, note, window, enter)
         return
     end
     local buffer = api.nvim_win_get_buf(window)
-    composer.close(false)
+    local editor = composer.for_source_window(window)
+    if editor then
+        composer.close(false, editor)
+    end
+    if
+        active ~= review
+        or not api.nvim_win_is_valid(window)
+        or api.nvim_get_current_win() ~= window
+        or api.nvim_win_get_buf(window) ~= buffer
+        or composer.owns_source_window(window)
+    then
+        return
+    end
     review.drafts.selected = note
     selected_position(review, window)
     refresh_sources(review)
@@ -262,6 +276,7 @@ local function show(review, note, window, enter)
         active ~= review
         or api.nvim_get_current_win() ~= window
         or api.nvim_win_get_buf(window) ~= buffer
+        or composer.owns_source_window(window)
     then
         return
     end
@@ -281,18 +296,23 @@ local function show(review, note, window, enter)
     -- The composer borrows display operations, not our note/view state.
     local room
     if view then
+        local room_owner = {}
         room = {
             namespace = view.namespace,
             reserve = function(row, lines)
-                return inline.reserve(view, note.id, row, lines)
+                return inline.reserve(view, note.id, row, lines, room_owner)
             end,
             release = function()
-                inline.release(view)
+                inline.release(view, room_owner)
             end,
         }
     end
 
-    composer.show(note, {
+    -- Repair options in place for older retained drafts, never their text/undo.
+    if api.nvim_buf_is_loaded(note.buffer) then
+        vim.bo[note.buffer].buftype = "nofile"
+    end
+    local opened = composer.show(note, {
         source_win = window,
         source_label = ("%s:%d"):format(note.path:gsub("[%c]", "?"), note.first),
         keymaps = review.keymaps.composer,
@@ -308,6 +328,11 @@ local function show(review, note, window, enter)
             end
         end,
     })
+    if active == review then
+        review.editor = opened
+    elseif opened then
+        composer.close(false, opened)
+    end
 end
 
 ---Explicit local composition only: no source discovery, captures or submitted turns.
@@ -359,9 +384,9 @@ function M.comment(scope)
     -- The composer applies Markdown formatting when presenting it.
     serial = serial + 1
     local buffer = api.nvim_create_buf(false, true)
-    api.nvim_buf_set_name(buffer, vim.fn.tempname() .. "-Parley Composer.md")
+    api.nvim_buf_set_name(buffer, ("parley://workspace/note-%d.md"):format(serial))
     vim.b[buffer].parley_composer = true
-    vim.bo[buffer].buftype = ""
+    vim.bo[buffer].buftype = "nofile"
     vim.bo[buffer].bufhidden = "hide"
     vim.bo[buffer].swapfile = false
     vim.bo[buffer].undofile = false
@@ -581,16 +606,19 @@ local review_actions = {
     },
 }
 
----@param keys table<string, string[]>
+---@param configured_keys table<string, string[]>
 ---@return ParleyWorkspace.Keymap[]
-local function resolve_review_bindings(keys)
+local function resolve_review_bindings(configured_keys)
     local bindings = {}
     for _, action in ipairs(review_actions) do
-        for _, key in ipairs(keys[action.name]) do
+        for _, key in ipairs(configured_keys[action.name]) do
+            local run = action.action
             bindings[#bindings + 1] = {
                 mode = action.mode,
-                key = key,
-                action = action.action,
+                key = keys.concrete(key),
+                action = function()
+                    run()
+                end,
                 description = action.description,
             }
         end
@@ -627,16 +655,14 @@ local function visit_buffer(review)
         return
     end
     local window = api.nvim_get_current_win()
-    local buffer = ordinary_file_buffer(window)
+    local buffer = workspace_source(review.workspace, window)
     if not buffer then
         return
     end
 
     install_review_bindings(review, buffer)
 
-    -- Source presentation remains workspace-scoped. Visiting an unrelated file
-    -- installs mode bindings, but never adds a note or captures a new source.
-    if workspace_source(review.workspace, window) then
+    if active == review then
         review.window = window
         if not review.views[window] and api.nvim__ns_set then
             review.views[window] = inline.open(window)
@@ -682,54 +708,74 @@ function M.activate(binding)
         views = {},
     }
     active = review
-    style.refresh()
+    local initialized, failure = pcall(function()
+        style.refresh()
 
-    api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
-        group = review.group,
-        callback = function()
-            visit_buffer(review)
-        end,
-    })
-    api.nvim_create_autocmd(
-        { "TextChanged", "TextChangedI", "TextChangedP", "WinClosed", "WinResized", "VimResized" },
-        {
+        api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+            group = review.group,
+            callback = function()
+                visit_buffer(review)
+            end,
+        })
+        api.nvim_create_autocmd({
+            "TextChanged",
+            "TextChangedI",
+            "TextChangedP",
+            "WinClosed",
+            "WinResized",
+            "VimResized",
+        }, {
             group = review.group,
             callback = function(event)
                 if not vim.b[event.buf].parley_composer then
                     schedule_refresh(review)
                 end
             end,
-        }
-    )
-    api.nvim_create_autocmd("OptionSet", {
-        group = review.group,
-        pattern = {
-            "wrap",
-            "linebreak",
-            "tabstop",
-            "number",
-            "relativenumber",
-            "numberwidth",
-            "signcolumn",
-            "foldcolumn",
-            "statuscolumn",
-            "winbar",
-        },
-        callback = function()
-            schedule_refresh(review)
-        end,
-    })
-    api.nvim_create_autocmd("ColorScheme", {
-        group = review.group,
-        callback = function()
-            style.refresh()
-            schedule_refresh(review)
-        end,
-    })
+        })
+        api.nvim_create_autocmd("OptionSet", {
+            group = review.group,
+            pattern = {
+                "wrap",
+                "linebreak",
+                "tabstop",
+                "number",
+                "relativenumber",
+                "numberwidth",
+                "signcolumn",
+                "foldcolumn",
+                "statuscolumn",
+                "winbar",
+            },
+            callback = function()
+                schedule_refresh(review)
+            end,
+        })
+        api.nvim_create_autocmd("ColorScheme", {
+            group = review.group,
+            callback = function()
+                style.refresh()
+                schedule_refresh(review)
+            end,
+        })
 
-    visit_buffer(review)
-    changed()
-    api.nvim_exec_autocmds("User", { pattern = "ParleyReviewStarted", data = { window = window } })
+        visit_buffer(review)
+        changed()
+        if active == review then
+            api.nvim_exec_autocmds(
+                "User",
+                { pattern = "ParleyReviewStarted", data = { window = window } }
+            )
+        end
+    end)
+    if not initialized then
+        if active == review then
+            pcall(M.stop)
+        end
+        error(failure, 0)
+    end
+    if active ~= review then
+        return false, "Workspace activation was stopped or replaced by a hook"
+    end
     return true
 end
 
@@ -741,32 +787,55 @@ function M.stop()
         return
     end
     active = nil
-    api.nvim_del_augroup_by_id(review.group)
-    composer.close(true)
+    local failed, failure
+    local function finish(action)
+        local ok, err = pcall(action)
+        if not ok and not failed then
+            failed, failure = true, err
+        end
+    end
+    finish(function()
+        api.nvim_del_augroup_by_id(review.group)
+    end)
+    local editor = review.editor
     for _, view in pairs(review.views) do
-        inline.clear(view)
+        finish(function()
+            inline.clear(view)
+        end)
     end
 
     for buffer, saved in pairs(review.maps) do
         if api.nvim_buf_is_valid(buffer) then
-            api.nvim_buf_call(buffer, function()
-                for index, binding in ipairs(review.bindings) do
-                    local mapping = vim.fn.maparg(binding.key, binding.mode, false, true)
-                    if mapping.buffer == 1 and mapping.callback == binding.action then
-                        vim.keymap.del(binding.mode, binding.key, { buffer = buffer })
-                        if saved[index].buffer == 1 then
-                            vim.fn.mapset(binding.mode, false, saved[index])
+            finish(function()
+                api.nvim_buf_call(buffer, function()
+                    for index, binding in ipairs(review.bindings) do
+                        local mapping = vim.fn.maparg(binding.key, binding.mode, false, true)
+                        if mapping.buffer == 1 and mapping.callback == binding.action then
+                            vim.keymap.del(binding.mode, binding.key, { buffer = buffer })
+                            if saved[index].buffer == 1 then
+                                vim.fn.mapset(binding.mode, false, saved[index])
+                            end
                         end
                     end
-                end
+                end)
             end)
         end
     end
-    changed()
-    api.nvim_exec_autocmds(
-        "User",
-        { pattern = "ParleyReviewStopped", data = { window = review.window } }
-    )
+    if editor then
+        finish(function()
+            composer.close(true, editor)
+        end)
+    end
+    finish(changed)
+    finish(function()
+        api.nvim_exec_autocmds(
+            "User",
+            { pattern = "ParleyReviewStopped", data = { window = review.window } }
+        )
+    end)
+    if failed then
+        error(failure, 0)
+    end
 end
 
 return M
