@@ -16,14 +16,11 @@ function M.setup(options)
 end
 
 function M.start()
-    local activated, err = require("parley.bridge").activate()
-    if not activated then
-        vim.notify("Parley: " .. (err or "Activation failed"), vim.log.levels.WARN)
-    end
+    require("parley.bridge").activate()
 end
 
 function M.stop()
-    workspace.stop()
+    require("parley.bridge").stop()
 end
 
 ---@param scope? 'line'|'range'

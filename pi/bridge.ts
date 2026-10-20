@@ -10,7 +10,7 @@ import { createHash, randomUUID } from "node:crypto";
 const actions = {
   attach: "bridge-attach",
   ping: "bridge-ping",
-  activate: "workspace-activate",
+  detach: "bridge-detach",
 } as const;
 
 export type EditorPeer = {
@@ -27,7 +27,7 @@ type WorkspaceIdentity = {
   readonly sessionId: string;
 };
 
-// Only identity fields are validated here; activation checks its own result fields.
+// Verification accepts only this identity result; there are no model-turn results.
 type ResultIdentity = Readonly<Record<string, unknown>> & {
   readonly version: 1;
   readonly nonce: string;
@@ -45,7 +45,7 @@ type Response = Readonly<Record<string, unknown>> & {
 
 type RequestResult = WorkspaceIdentity & {
   readonly editorId: string;
-  readonly nonce: unknown;
+  readonly nonce: string;
 };
 
 type PendingRequest = {
@@ -111,6 +111,9 @@ export class WorkspaceBridge {
   private server?: net.Server;
   private readonly sockets = new Set<net.Socket>();
   private readonly peers = new Map<net.Socket, EditorPeer>();
+  // Retain the chosen editor through disconnects. Only its explicit detach (or
+  // withdrawing this offer) releases the slot; another editor cannot steal it.
+  private editor?: EditorPeer;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly instanceId = randomUUID();
   private readonly lease: string;
@@ -204,14 +207,35 @@ export class WorkspaceBridge {
           resolve();
         });
       });
+      let ready = false;
+      let startupFailure: Error | undefined;
       server.on("error", error => {
-        this.onFailure(error);
-        void this.stop().catch(failure => console.error("Parley shutdown failed", failure));
+        if (!ready) {
+          // start() owns cleanup until publication finishes. Stopping during
+          // advertise() could otherwise recreate a lease after its removal.
+          startupFailure = error;
+          return;
+        }
+        try {
+          this.onFailure(error);
+        } catch (failure) {
+          console.error("Parley failure reporting failed", failure);
+        } finally {
+          void this.stop().catch(failure => console.error("Parley shutdown failed", failure));
+        }
       });
       await fs.chmod(socket, 0o600);
       await advertise(this.lease, { ...this.identity(), socket });
+      if (startupFailure) {
+        throw startupFailure;
+      }
+      ready = true;
     } catch (error) {
-      await this.stop();
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        console.error("Parley startup cleanup failed", cleanupError);
+      }
       throw error;
     }
   }
@@ -220,15 +244,15 @@ export class WorkspaceBridge {
     return [...this.peers.values()].map(peer => ({ ...peer }));
   }
 
-  // Activation is idempotent editor state, not creation of a frozen review object.
-  async activateEditor(editorId: string): Promise<void> {
+  // Attach proves both socket directions before acknowledging the pairing.
+  private async verifyEditor(editorId: string): Promise<void> {
     const matches = [...this.peers].filter(([, peer]) => peer.editorId === editorId);
     if (this.stopping || matches.length !== 1) {
       throw new Error("Editor is missing or ambiguous; select an exact connected peer");
     }
     const [socket, peer] = matches[0];
     const requestId = randomUUID();
-    const result = await new Promise<ResultIdentity>((resolve, reject) => {
+    await new Promise<ResultIdentity>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
         reject(new Error(`Editor result timed out for ${requestId}; delivery unknown. Check Neovim review status; no automatic replay.`));
@@ -238,14 +262,11 @@ export class WorkspaceBridge {
       this.send(socket, {
         version: 1,
         requestId,
-        action: actions.activate,
+        action: actions.ping,
+        workspace: this.root,
         payload: { ...this.identity(), nonce: requestId, editorId },
       });
     });
-    if (result.active !== true) {
-      socket.destroy();
-      throw new Error("Editor activation result is invalid");
-    }
   }
 
   private matchesIdentity(value: unknown, requestId: string, peer: EditorPeer): value is ResultIdentity {
@@ -275,7 +296,11 @@ export class WorkspaceBridge {
         entry.reject(new Error(`Editor disconnected before result for ${requestId}; delivery unknown. No automatic replay.`));
       }
       if (this.peers.delete(client)) {
-        this.onPeersChanged();
+        try {
+          this.onPeersChanged();
+        } catch (error) {
+          console.error("Parley peer status reporting failed", error);
+        }
       }
     });
     let buffer = "";
@@ -292,7 +317,11 @@ export class WorkspaceBridge {
         }
         const line = buffer.slice(0, end);
         buffer = buffer.slice(end + 1);
-        this.handleMessage(client, line);
+        void this.handleMessage(client, line).catch(error => {
+          // A reporting failure must still close this peer, not the offer.
+          client.destroy();
+          console.error("Parley peer handler failed", error);
+        });
         if (client.destroyed) {
           return;
         }
@@ -300,7 +329,7 @@ export class WorkspaceBridge {
     });
   }
 
-  private handleMessage(client: net.Socket, line: string): void {
+  private async handleMessage(client: net.Socket, line: string): Promise<void> {
     let requestId = "invalid";
     try {
       if (this.stopping) {
@@ -316,7 +345,7 @@ export class WorkspaceBridge {
         this.handleResponse(client, { ...message, version: 1, requestId, ok: message.ok });
         return;
       }
-      const result = this.handleRequest(client, message);
+      const result = await this.handleRequest(client, message);
       this.send(client, { version: 1, requestId, ok: true, result });
     } catch (error) {
       this.send(client, {
@@ -337,7 +366,7 @@ export class WorkspaceBridge {
     clearTimeout(entry.timer);
     this.pending.delete(message.requestId);
     if (!message.ok) {
-      entry.reject(new Error(typeof message.error === "string" ? message.error : "Editor rejected activation"));
+      entry.reject(new Error(typeof message.error === "string" ? message.error : "Editor rejected bridge verification"));
     } else if (!this.matchesIdentity(message.result, message.requestId, entry.peer)) {
       entry.reject(new Error("Editor result identity mismatch"));
       client.destroy();
@@ -346,13 +375,14 @@ export class WorkspaceBridge {
     }
   }
 
-  private handleRequest(client: net.Socket, message: Readonly<Record<string, unknown>>): RequestResult {
+  private async handleRequest(client: net.Socket, message: Readonly<Record<string, unknown>>): Promise<RequestResult> {
     const payload = asRecord(message.payload);
     const editorId = payload?.editorId;
     if (message.workspace !== this.root
       || payload?.instanceId !== this.instanceId
       || payload?.sessionId !== this.sessionId
-      || !isIdentifier(editorId)) {
+      || !isIdentifier(editorId)
+      || !isIdentifier(payload?.nonce)) {
       throw new Error("Bridge identity changed; rediscover and explicitly rebind if the session changed");
     }
     switch (message.action) {
@@ -361,14 +391,45 @@ export class WorkspaceBridge {
         if (typeof label !== "string" || label.length > 512) {
           throw new Error("Invalid editor label");
         }
-        if (this.peers.has(client) || [...this.peers].some(([, peer]) => peer.editorId === editorId)) {
-          throw new Error("Editor already attached");
+        if (this.editor && this.editor.editorId !== editorId) {
+          throw new Error("Another Neovim owns this review; :ReviewStop there before pairing another editor");
         }
-        this.peers.set(client, {
+        if (this.peers.size > 0) {
+          throw new Error("The selected editor already has a live connection; no connection replaced");
+        }
+        const peer = {
           editorId,
           sessionId: this.sessionId,
           label: label.replace(/[\x00-\x1f\x7f]/g, " "),
-        });
+        };
+        // The retained object also identifies this claim's lifetime: an old
+        // failed verification must never clear a replacement claim.
+        this.editor ??= peer;
+        this.peers.set(client, peer);
+        try {
+          await this.verifyEditor(editorId);
+          if (client.destroyed || this.peers.get(client) !== peer) {
+            throw new Error("Editor disconnected during pairing");
+          }
+          this.onPeersChanged();
+        } catch (error) {
+          if (this.peers.get(client) === peer) {
+            this.peers.delete(client);
+          }
+          if (this.editor === peer && this.peers.size === 0) {
+            this.editor = undefined;
+          }
+          throw error;
+        }
+        break;
+      }
+      case actions.detach: {
+        if (this.editor?.editorId !== editorId
+          || [...this.peers].some(([socket]) => socket !== client)) {
+          throw new Error("Only the selected editor can release its review attachment");
+        }
+        this.peers.delete(client);
+        this.editor = undefined;
         this.onPeersChanged();
         break;
       }
@@ -409,14 +470,28 @@ export class WorkspaceBridge {
   }
 
   private async shutdown(): Promise<void> {
-    for (const client of this.sockets) {
-      client.destroy();
-    }
-    const server = this.server;
-    if (server?.listening) {
-      await new Promise<void>(resolve => server.close(() => resolve()));
-    }
-    try {
+    let failed = false;
+    let failure: unknown;
+    const finish = async (action: () => Promise<void>): Promise<void> => {
+      try {
+        await action();
+      } catch (error) {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        }
+      }
+    };
+    await finish(async () => {
+      for (const client of this.sockets) {
+        client.destroy();
+      }
+      const server = this.server;
+      if (server?.listening) {
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    });
+    await finish(async () => {
       if (this.ownsLease) {
         const leaseData: unknown = JSON.parse(await fs.readFile(this.lease, "utf8"));
         const descriptor = asRecord(leaseData);
@@ -425,10 +500,14 @@ export class WorkspaceBridge {
         }
         this.ownsLease = false;
       }
-    } finally {
+    });
+    await finish(async () => {
       if (this.runtime) {
         await fs.rm(this.runtime, { recursive: true, force: true });
       }
+    });
+    if (failed) {
+      throw failure;
     }
   }
 }

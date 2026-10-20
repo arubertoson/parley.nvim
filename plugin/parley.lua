@@ -5,16 +5,10 @@ vim.g.loaded_parley = true
 
 vim.api.nvim_create_user_command("ReviewStart", function()
     require("parley").start()
-end, { desc = "Enable workspace review mode using the connected Pi session; no capture" })
+end, { desc = "Pair with the Pi review offer and start local review; no capture or model work" })
 vim.api.nvim_create_user_command("ReviewStop", function()
     require("parley").stop()
 end, { desc = "Detach workspace review; keep buffers and drafts" })
-
-vim.api.nvim_create_user_command("ParleyBind", function()
-    require("parley.bridge").bind()
-end, {
-    desc = "Explicitly bind the current workspace's advertised Pi session; no review activation",
-})
 
 vim.api.nvim_create_user_command("ParleyDemo", function(options)
     if options.args == "append" then
@@ -33,8 +27,3 @@ end, {
     end,
     desc = "Open, append sample history, or reload local demo UI; no agent execution",
 })
-
-vim.schedule(function()
-    require("parley.bridge").start()
-end)
--- Passive workspace discovery belongs to plugin activation, never require("parley").

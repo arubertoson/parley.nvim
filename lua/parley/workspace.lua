@@ -634,6 +634,23 @@ local function visit_buffer(review)
     refresh_sources(review)
 end
 
+---Validate explicit entry without acquiring presentation or changing selection.
+---@param binding ParleyWorkspace.Binding
+---@return boolean ready
+---@return string? failure
+function M.can_activate(binding)
+    if
+        active and (active.workspace ~= binding.workspace or active.sessionId ~= binding.sessionId)
+    then
+        return false, "Another workspace/Pi session is active; :ReviewStop before starting another"
+    end
+    if vim.fn.mode() ~= "n" or not workspace_source(binding.workspace) then
+        return false,
+            "Neovim is busy; review requires an ordinary workspace source window in normal mode"
+    end
+    return true
+end
+
 ---Copy only the verified workspace/conversation identity. Activation never opens
 ---an editor, navigates, submits a turn or migrates another conversation's notes.
 ---@param binding ParleyWorkspace.Binding
@@ -648,12 +665,11 @@ function M.activate(binding)
             "Another workspace/Pi session is active; stop it explicitly before activating"
     end
 
-    local window = api.nvim_get_current_win()
-    if vim.fn.mode() ~= "n" or not workspace_source(binding.workspace, window) then
-        return false,
-            "Neovim is busy; activation requires an ordinary workspace source window in normal mode"
+    local ready, err = M.can_activate(binding)
+    if not ready then
+        return false, err
     end
-
+    local window = api.nvim_get_current_win()
     local configured = config.get()
     local sessions = conversations[binding.workspace] or {}
     conversations[binding.workspace] = sessions

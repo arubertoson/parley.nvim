@@ -1,144 +1,137 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { WorkspaceBridge, workspaceRoot } from "./bridge.ts";
 
-// Registration is inert. The session owns a passive bridge; /review owns activation.
+// Only /review publishes an offer. Neovim's ReviewStart owns pairing/activation.
 export default function parley(pi: ExtensionAPI): void {
   let bridge: WorkspaceBridge | undefined;
   let context: ExtensionContext | undefined;
   let generation = 0;
-  let activating = false;
+  let failed = false;
   let startup: Promise<void> | undefined;
 
-  pi.on("session_start", async (_event, ctx) => {
-    if (ctx.mode !== "tui") {
-      return;
-    }
-    const sessionGeneration = ++generation;
-    context = ctx;
+  // Session changes/reloads withdraw the old offer; they never republish it.
+  async function withdraw(ctx: ExtensionContext): Promise<void> {
+    const token = ++generation;
     const previous = bridge;
-    const previousStartup = startup;
     bridge = undefined;
-    startup = (async () => {
-      // The previous session handler reports its own startup failure.
-      await previousStartup?.catch(() => {});
-      await previous?.stop();
-      const root = await workspaceRoot(ctx.cwd);
-      if (generation !== sessionGeneration) {
-        return;
+    context = ctx;
+    // An interrupted /review cleans up its own not-yet-published owner. Both
+    // lifetimes must finish even if one fails; preserve the first failure.
+    const results = await Promise.allSettled([startup, previous?.stop()]);
+    const rejected = results.find(result => result.status === "rejected");
+    try {
+      if (generation === token && context === ctx && ctx.mode === "tui") {
+        ctx.ui.setStatus("parley-bridge", undefined);
       }
-      const owner = new WorkspaceBridge(root, ctx.sessionManager.getSessionId());
-      let failed = false;
-      owner.onPeersChanged = () => {
-        if (bridge === owner && !failed && context?.mode === "tui") {
-          context.ui.setStatus("parley-bridge", `Parley bridge · ${owner.editorChoices().length} editor(s)`);
-        }
-      };
-      owner.onFailure = error => {
-        if (bridge !== owner) {
-          return;
-        }
-        failed = true;
-        ctx.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload");
-        ctx.ui.notify(`Parley bridge: ${error.message}`, "error");
-      };
-      try {
-        await owner.start();
-        if (generation !== sessionGeneration) {
-          await owner.stop();
-          return;
-        }
-        bridge = owner;
-        owner.onPeersChanged();
-      } catch (error) {
-        await owner.stop();
+    } catch (error) {
+      if (!rejected) {
         throw error;
       }
-    })();
-    try {
-      await startup;
-    } catch (error) {
-      if (generation !== sessionGeneration) {
-        return;
-      }
-      ctx.ui.setStatus("parley-bridge", "Parley bridge unavailable · /reload in a workspace");
-      ctx.ui.notify(`Parley bridge: ${String(error)}. No review activated.`, "error");
+      console.error("Parley status cleanup failed", error);
     }
-  });
+    if (rejected) {
+      throw rejected.reason;
+    }
+  }
 
-  pi.on("session_shutdown", async () => {
-    ++generation;
-    const owner = bridge;
-    bridge = undefined;
-    if (context?.mode === "tui") {
-      context.ui.setStatus("parley-bridge", undefined);
+  pi.on("session_start", (_event, ctx) => withdraw(ctx));
+  pi.on("session_shutdown", async (_event, ctx) => {
+    try {
+      await withdraw(ctx);
+    } finally {
+      if (context === ctx) {
+        context = undefined;
+      }
     }
-    context = undefined;
-    // The startup handler reports its own failure.
-    await startup?.catch(() => {});
-    await owner?.stop();
   });
 
   pi.registerCommand("review", {
-    description: "Enable workspace review mode in the matching connected Neovim; no capture or model work",
+    description: "Offer this Pi session for review; use :ReviewStart in Neovim to pair and activate",
     handler: async (args, ctx) => {
       if (ctx.mode !== "tui") {
         ctx.ui.notify("Parley requires the existing interactive Pi process", "error");
         return;
       }
       if (args.trim()) {
-        ctx.ui.notify("Use /review without arguments. This command only activates workspace review mode.", "error");
+        ctx.ui.notify("Use /review without arguments, then :ReviewStart in Neovim.", "error");
         return;
       }
-      if (activating || !ctx.isIdle() || ctx.hasPendingMessages()) {
-        ctx.ui.notify("Pi is busy; no review activated.", "error");
+      if (startup || !ctx.isIdle() || ctx.hasPendingMessages()) {
+        ctx.ui.notify("Pi is busy; no review offer started.", "error");
         return;
       }
-      const owner = bridge;
-      const sessionGeneration = generation;
       const sessionId = ctx.sessionManager.getSessionId();
-      if (!owner || owner.sessionId !== sessionId) {
-        ctx.ui.notify("No matching workspace bridge; /reload in this workspace.", "error");
+      if (bridge && !failed && bridge.sessionId === sessionId) {
+        ctx.ui.notify("This Pi session is already available; use :ReviewStart in Neovim.", "info");
         return;
       }
-      // Recheck ownership and availability after dialogs and transport awaits.
-      const canActivate = (): boolean => {
-        return generation === sessionGeneration
-          && bridge === owner
-          && ctx.sessionManager.getSessionId() === sessionId
-          && ctx.isIdle()
-          && !ctx.hasPendingMessages();
-      };
-      activating = true;
-      try {
-        const editors = owner.editorChoices();
-        if (editors.length === 0) {
-          throw new Error("No matching connected Neovim; check :checkhealth parley");
-        }
-        let editor = editors.length === 1 ? editors[0] : undefined;
-        if (!editor) {
-          const labels = editors.map(peer => `${peer.label} · ${peer.editorId}`);
-          const selected = await ctx.ui.select("Activate review in which Neovim?", labels);
-          if (selected === undefined || !canActivate()) {
-            return;
-          }
-          editor = editors[labels.indexOf(selected)];
-          if (!editor) {
-            throw new Error("Unknown editor selection");
-          }
-        }
-        if (!canActivate()) {
+      const sessionGeneration = generation;
+      const previous = bridge;
+      bridge = undefined;
+      const current = (): boolean => generation === sessionGeneration
+        && context === ctx
+        && ctx.sessionManager.getSessionId() === sessionId;
+      // Command contexts may be distinct objects from the lifecycle context.
+      context = ctx;
+      const operation = (async () => {
+        await previous?.stop();
+        const root = await workspaceRoot(ctx.cwd);
+        if (!current()) {
           return;
         }
-        await owner.activateEditor(editor.editorId);
-        if (canActivate()) {
-          ctx.ui.notify(`Workspace review active in ${editor.label}. No capture or model work started.`, "info");
+        const owner = new WorkspaceBridge(root, sessionId);
+        owner.onPeersChanged = () => {
+          if (bridge === owner && !failed && current()) {
+            const attached = owner.editorChoices().length > 0;
+            ctx.ui.setStatus("parley-bridge", attached
+              ? "Parley review · editor paired"
+              : "Parley review available · :ReviewStart in Neovim");
+          }
+        };
+        owner.onFailure = error => {
+          if (bridge !== owner || !current()) {
+            return;
+          }
+          failed = true;
+          ctx.ui.setStatus("parley-bridge", "Parley unavailable · /review");
+          ctx.ui.notify(`Parley bridge: ${error.message}`, "error");
+        };
+        try {
+          await owner.start();
+          if (!current()) {
+            await owner.stop();
+            return;
+          }
+          bridge = owner;
+          failed = false;
+          owner.onPeersChanged();
+        } catch (error) {
+          if (bridge === owner) {
+            bridge = undefined;
+          }
+          try {
+            await owner.stop();
+          } catch (cleanupError) {
+            console.error("Parley offer cleanup failed", cleanupError);
+          }
+          throw error;
+        }
+      })();
+      startup = operation;
+      try {
+        await operation;
+        if (current() && bridge) {
+          ctx.ui.notify("Review available. Use :ReviewStart in Neovim. No model or capture started.", "info");
         }
       } catch (error) {
-        if (generation === sessionGeneration) {
-          ctx.ui.notify(`Parley: ${error instanceof Error ? error.message : String(error)}`, "error");
+        if (current()) {
+          ctx.ui.setStatus("parley-bridge", undefined);
+          ctx.ui.notify(`Parley: ${String(error)}. No review offer started.`, "error");
         }
       } finally {
-        activating = false;
+        if (startup === operation) {
+          startup = undefined;
+        }
       }
     },
   });
