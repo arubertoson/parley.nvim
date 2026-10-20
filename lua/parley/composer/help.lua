@@ -12,6 +12,11 @@ local namespace
 ---@field buffer? integer Disposable scratch text, not a draft.
 ---@field row? ParleyNoteLine Last rendered chunks.
 
+---@return boolean
+function M.is_enabled()
+    return enabled
+end
+
 function M.toggle()
     if vim.fn.mode() ~= "n" then
         return

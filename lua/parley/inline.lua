@@ -1,13 +1,16 @@
 -- Adapted from legacy/lua/parley/inline.lua and its shared card presentation.
 -- Original provenance: arubertoson/nvim, lua/aru/workspace/review_inline.lua.
----Window-local human-note cards. The workspace supplies validated placements;
----this module owns display marks only, never source anchors, drafts or history.
+---Window-local note/thread cards. The workspace supplies validated placements;
+---this module owns display marks and their focus/cursor hooks, never source
+---anchors, drafts or history.
 local style = require("parley.composer.style")
 local M = {}
 local api = vim.api
 
 ---@class ParleyInline.Item
 ---@field note ParleyComposer.Draft Borrowed editor-owned text.
+---@field thread? ParleyThread Borrowed read-only conversation.
+---@field pending? ParleyComposer.Draft Borrowed editable entry displayed after committed history.
 ---@field first integer Validated live source range.
 ---@field last integer
 
@@ -32,6 +35,7 @@ local api = vim.api
 ---@field reservation? ParleyInline.Reservation
 ---@field rows ParleyInline.Row[]
 ---@field marks table<integer, integer>
+---@field group? integer Display-only cursor/focus refresh hooks.
 
 ---@return ParleyInline.View
 function M.open(window)
@@ -42,6 +46,10 @@ end
 
 ---@param view ParleyInline.View
 function M.clear(view)
+    if view.group then
+        api.nvim_del_augroup_by_id(view.group)
+        view.group = nil
+    end
     if view.buffer and api.nvim_buf_is_loaded(view.buffer) then
         api.nvim_buf_clear_namespace(view.buffer, view.namespace, 0, -1)
     end
@@ -52,19 +60,50 @@ end
 
 local function card(view, item, budget)
     local indent, width, padding = style.layout(view.window)
+    -- Remembering the last note for navigation does not keep it highlighted
+    -- after the source cursor or focus leaves its attachment.
+    local line = api.nvim_win_get_cursor(view.window)[1]
     local selected = item.note.id == view.selected
-    local text = api.nvim_buf_get_lines(item.note.buffer, 0, -1, false)
-    local state = "draft"
-    if item.note.saved_lines then
-        state = vim.deep_equal(text, item.note.saved_lines) and "saved" or "unsaved edits"
+        and api.nvim_get_current_win() == view.window
+        and line >= item.first
+        and line <= item.last
+    local preview = item.note
+    local text, state, role
+    if item.thread then
+        budget = math.min(8, budget)
+        if item.pending then
+            preview = item.pending
+            text = api.nvim_buf_get_lines(item.pending.buffer, 0, -1, false)
+            state = ("draft · %d entries"):format(#item.thread.messages + 1)
+            role = "human"
+        elseif #item.thread.messages > 0 then
+            preview = item.thread.messages[#item.thread.messages]
+            text = preview.lines
+            state = ("%d messages"):format(#item.thread.messages)
+            role = preview.role
+        end
+    end
+    if not text then
+        text = api.nvim_buf_get_lines(item.note.buffer, 0, -1, false)
+        state = "draft"
+        if item.note.saved_lines then
+            state = vim.deep_equal(text, item.note.saved_lines) and "saved" or "unsaved edits"
+        end
     end
 
-    local heading = style.heading(item.note, state, item.first, item.last, width)
+    local heading = style.heading(
+        preview,
+        state,
+        item.first,
+        item.last,
+        width,
+        role == "agent" and "Agent" or "You"
+    )
     local lines = {
-        style.card_line(indent, width, padding, {}, selected),
+        style.card_line(indent, width, padding, {}, selected, role),
         style.card_line(indent, width, padding, {
             { heading, "ParleyReviewNoteHeading" },
-        }, selected),
+        }, selected, role),
     }
 
     local body = selected and "ParleyReviewNoteActive" or "ParleyReviewNote"
@@ -72,15 +111,15 @@ local function card(view, item, budget)
         for _, wrapped in ipairs(style.wrap(value, width)) do
             if #lines >= budget - 1 then
                 lines[#lines] =
-                    style.card_line(indent, width, padding, { { "…", body } }, selected)
-                lines[#lines + 1] = style.card_line(indent, width, padding, {}, selected)
+                    style.card_line(indent, width, padding, { { "…", body } }, selected, role)
+                lines[#lines + 1] = style.card_line(indent, width, padding, {}, selected, role)
                 return lines
             end
             lines[#lines + 1] =
-                style.card_line(indent, width, padding, { { wrapped, body } }, selected)
+                style.card_line(indent, width, padding, { { wrapped, body } }, selected, role)
         end
     end
-    lines[#lines + 1] = style.card_line(indent, width, padding, {}, selected)
+    lines[#lines + 1] = style.card_line(indent, width, padding, {}, selected, role)
     return lines
 end
 
@@ -143,6 +182,40 @@ local function render_row(view, row, items)
     return { row = row, lines = lines, focus_first = focus_first, focus_count = focus_count }
 end
 
+-- Source movement changes emphasis only. Never reveal a card, enter an editor,
+-- change the host's remembered selection or redraw borrowed discussion room.
+local function watch_selection(view)
+    if view.group then
+        return
+    end
+    local group = api.nvim_create_augroup("ParleyInline" .. view.namespace, { clear = true })
+    view.group = group
+    local pending = false
+    api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "WinEnter", "WinLeave" }, {
+        group = group,
+        callback = function()
+            if pending then
+                return
+            end
+            pending = true
+            -- WinLeave runs before focus has moved; inspect the settled window.
+            vim.schedule(function()
+                pending = false
+                if
+                    view.group == group
+                    and not view.reservation
+                    and view.buffer
+                    and api.nvim_buf_is_loaded(view.buffer)
+                    and api.nvim_win_is_valid(view.window)
+                    and api.nvim_win_get_buf(view.window) == view.buffer
+                then
+                    M.update(view, view.buffer, view.items, view.selected)
+                end
+            end)
+        end,
+    })
+end
+
 ---Replace cards/room in place; do not clear through zero height or scroll the view.
 ---@param view ParleyInline.View
 ---@param buffer integer
@@ -153,6 +226,7 @@ function M.update(view, buffer, items, selected)
         M.clear(view)
     end
     view.buffer, view.items, view.selected = buffer, items, selected
+    watch_selection(view)
 
     local grouped = {}
     if api.nvim_win_get_width(view.window) >= 24 and api.nvim_win_get_height(view.window) >= 8 then

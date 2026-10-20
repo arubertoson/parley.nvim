@@ -1,6 +1,6 @@
 -- Adapted from legacy/lua/parley/style.lua, originally extracted from
 -- arubertoson/nvim: lua/aru/workspace/review_style.lua.
----Shared human-card presentation. The composer refreshes its own theme; callers
+---Shared card presentation. The composer refreshes its own theme; callers
 ---drawing inactive cards own their theme lifecycle. Requiring installs no hooks.
 local M = {}
 local api = vim.api
@@ -24,9 +24,12 @@ function M.refresh()
     local comment = api.nvim_get_hl(0, { name = "Comment", link = false })
     local hint = api.nvim_get_hl(0, { name = "LspInlayHint", link = false })
     local human = api.nvim_get_hl(0, { name = "DiagnosticHint", link = false })
+    local agent = api.nvim_get_hl(0, { name = "DiagnosticInfo", link = false })
 
     local background = blend(normal.bg, normal.fg, 0.025)
     local foreground = blend(hint.fg or comment.fg, background, 0.12)
+    -- Both roles inherit the original muted note style. Selection alone
+    -- brings out the text; authorship is carried by labels and role bars.
     api.nvim_set_hl(0, "ParleyReviewNote", {
         fg = foreground,
         bg = background,
@@ -42,9 +45,29 @@ function M.refresh()
         italic = true,
     })
     api.nvim_set_hl(0, "ParleyReviewNoteActive", {
-        fg = blend(foreground, normal.fg, 0.25),
+        fg = blend(foreground, normal.fg, 0.85),
         bg = background,
         italic = true,
+    })
+    api.nvim_set_hl(0, "ParleyDiscussionAgentMarker", {
+        fg = agent.fg or normal.fg,
+        bg = background,
+    })
+
+    -- Parent headings/markers yield to the selected message; its body stays
+    -- muted like any other unselected card.
+    api.nvim_set_hl(0, "ParleyDiscussionParentHeading", {
+        fg = blend(foreground, background, 0.65),
+        bg = background,
+        italic = true,
+    })
+    api.nvim_set_hl(0, "ParleyDiscussionParentHumanMarker", {
+        fg = blend(human.fg or normal.fg, foreground, 0.6),
+        bg = background,
+    })
+    api.nvim_set_hl(0, "ParleyDiscussionParentAgentMarker", {
+        fg = blend(agent.fg or normal.fg, foreground, 0.6),
+        bg = background,
     })
 
     -- The small help annotation is darker than the prose, with quiet labels
@@ -85,15 +108,17 @@ end
 
 ---@alias ParleyNoteLine string[][] Dense { text, highlight } chunks.
 
----Three-column card padding, human role bar, and full-width background.
+---Three-column card padding, role bar, and full-width background.
 ---@param chunks string[][] Text only, without padding.
 ---@param active? boolean
+---@param role? 'human'|'agent'
 ---@return ParleyNoteLine
-function M.card_line(indent, width, padding, chunks, active)
+function M.card_line(indent, width, padding, chunks, active, role)
     local body = active and "ParleyReviewNoteActive" or "ParleyReviewNote"
+    local marker = role == "agent" and "ParleyDiscussionAgentMarker" or "ParleyReviewHumanMarker"
     local line = { { string.rep(" ", indent - padding), "Normal" } }
     if padding > 0 then
-        line[#line + 1] = { "▎" .. string.rep(" ", padding - 1), "ParleyReviewHumanMarker" }
+        line[#line + 1] = { "▎" .. string.rep(" ", padding - 1), marker }
     end
 
     local used = 0
@@ -164,16 +189,17 @@ function M.wrap(text, width)
     return lines
 end
 
----One-row human-note heading: role/state left, creation date/source range right.
+---One-row card heading: role/state left, creation date/source range right.
 ---Unknown dates stay absent. Metadata yields space before the role/state does.
----@param note ParleyComposer.Draft
+---@param note { created_at?: integer }
 ---@param state string
 ---@param first integer
 ---@param last integer
 ---@param width integer
+---@param role_label? string Defaults to You.
 ---@return string
-function M.heading(note, state, first, last, width)
-    local left = "You · " .. state
+function M.heading(note, state, first, last, width, role_label)
+    local left = (role_label or "You") .. " · " .. state
     local left_width = vim.fn.strdisplaywidth(left)
     if left_width > width then
         return M.wrap(left, width)[1]
@@ -182,10 +208,15 @@ function M.heading(note, state, first, last, width)
     local right = M.label(first, last)
     if note.created_at then
         for _, format in ipairs({ "%Y-%m-%d %H:%M", "%Y-%m-%d" }) do
-            local dated = os.date(format, note.created_at) .. " · " .. right
-            if left_width + 1 + vim.fn.strdisplaywidth(dated) <= width then
-                right = dated
-                break
+            -- An otherwise valid timestamp can exceed this host's date range.
+            -- Optional display metadata must not make a discussion unopenable.
+            local valid, date = pcall(os.date, format, note.created_at)
+            if valid then
+                local dated = date .. " · " .. right
+                if left_width + 1 + vim.fn.strdisplaywidth(dated) <= width then
+                    right = dated
+                    break
+                end
             end
         end
     end

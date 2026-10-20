@@ -33,6 +33,8 @@ local api = vim.api
 ---@field keymaps? ParleyComposer.Keymaps|false Overrides for this editor; false disables all defaults.
 ---@field navigate fun(step: integer)
 ---@field changed fun() Refresh caller presentation after releasing room.
+---@field closed? fun(restore: boolean) After teardown; true only for an explicit, focused exit.
+---@field draft_label? string Optional editing label; no thread/workflow state is owned here.
 
 ---@class ParleyComposer.Mapping
 ---@field name string Composer action; aliases share one footer hint.
@@ -191,6 +193,9 @@ function M.close(restore)
     then
         vim.fn.winrestview(editor.source_view)
     end
+    if editor.options.closed then
+        editor.options.closed(restore == true and focused and current == nil)
+    end
 end
 
 ---Like the original composer, measure folds/wrapping/filler before redraw rather
@@ -318,7 +323,9 @@ local function geometry(editor, reveal)
     end
 
     local indent, width, padding = style.layout(editor.source_win)
-    local heading = { style.heading(editor.note, "editing", first, last, width) }
+    local heading = {
+        style.heading(editor.note, editor.options.draft_label or "editing", first, last, width),
+    }
     local below = last < api.nvim_buf_line_count(editor.source_buf) and 1 or 0
     local available = window_height - #heading - 3 - below
     if available < 1 then
