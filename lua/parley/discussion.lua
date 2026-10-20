@@ -909,7 +909,8 @@ function M.open(data, options)
             vim.bo[display.buffer].swapfile = false
             vim.bo[display.buffer].undofile = false
             vim.bo[display.buffer].filetype = "markdown"
-            vim.bo[display.buffer].readonly = true
+            -- Nonmodifiable guards user edits without readonly warnings on renders.
+            vim.bo[display.buffer].readonly = false
         end
         local actions = {
             next_message = function()
