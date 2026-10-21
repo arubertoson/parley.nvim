@@ -12,6 +12,14 @@ local thread = require("parley.thread")
 local M = {}
 local api = vim.api
 local serial = 0
+-- Capture handles own private copies; exporting a payload never lends out draft
+-- buffers or mutable history. Unused handles can be collected by their caller.
+local captures = setmetatable({}, { __mode = "k" })
+
+local function fresh_id(kind)
+    serial = serial + 1
+    return ("parley-%s-%d-%.0f-%d"):format(kind, vim.uv.os_getpid(), vim.uv.hrtime(), serial)
+end
 
 ---@class ParleyConversation.Seed
 ---@field id? string
@@ -26,7 +34,7 @@ local serial = 0
 ---@field drafts ParleyDiscussion.Draft[] All retained buffers, including older replies/revisions.
 ---@field replies table<string, ParleyDiscussion.Draft> Exact committed parent to reply draft.
 ---@field revisions table<string, ParleyDiscussion.Draft> Submitted human ID to copied draft.
----@field pending? ParleyDiscussion.Draft Only this unsent entry is currently presented.
+---@field pending? ParleyDiscussion.Draft Only this retained editable entry is currently presented.
 ---@field state ParleyDiscussion.State Retained reading state, not canonical history.
 
 ---@class ParleyConversation.Item
@@ -100,7 +108,7 @@ end
 ---@return ParleyConversation
 function M.new(seed)
     seed = seed or {}
-    local history = thread.new(seed.id or ("conversation-" .. (serial + 1)))
+    local history = thread.new(seed.id or fresh_id("conversation"))
     for _, message in ipairs(seed.messages or {}) do
         local appended, failure = thread.append(history, message)
         assert(appended, failure)
@@ -152,6 +160,16 @@ end
 ---@param data ParleyConversation
 ---@return ParleyInline.Preview? preview Nil uses the initial local-note card.
 function M.preview(data)
+    if data.resolved then
+        local latest = data.thread.messages[#data.thread.messages]
+        return {
+            buffer = not latest and data.note.buffer or nil,
+            lines = latest and latest.lines or nil,
+            role = latest and latest.role or "human",
+            state = "resolved",
+            created_at = latest and latest.created_at or data.note.created_at,
+        }
+    end
     if #data.thread.messages == 0 then
         return
     end
@@ -509,6 +527,203 @@ function M.move(source, step)
     if #items > 0 then
         M.show(source, items[step > 0 and 1 or #items].conversation)
     end
+end
+
+---@class ParleyConversation.Capture
+---@field conversation_id string
+---@field base_version integer
+---@field base_tip_id? string
+---@field message ParleyThread.Message Fresh submitted identity, never a draft entry ID.
+---@field version integer
+---@field supersedes string[] Exact active suffix removed by accepting this prose.
+---@field replaces_id? string
+
+---Capture only the current eligible entry (or the initial note before entry).
+---The returned handle is read-only; its private snapshot is independent of later
+---edits. Empty/unchanged prose returns nil without error. Older retained drafts
+---are not implicitly selected, retargeted or submitted alongside the current one.
+---@param data ParleyConversation
+---@param author string
+---@param origin string
+---@return ParleyConversation.Capture? capture
+---@return string? failure
+function M.capture(data, author, origin)
+    local draft = data.pending or data.note
+    if not api.nvim_buf_is_loaded(draft.buffer) then
+        return nil, "retained draft buffer is unavailable; it was not recreated"
+    end
+    local lines = api.nvim_buf_get_lines(draft.buffer, 0, -1, false)
+    if not table.concat(lines, "\n"):find("%S") then
+        return
+    end
+    local accepted = draft.accepted
+    if accepted and vim.deep_equal(lines, accepted.lines) then
+        return
+    end
+    local history = data.thread
+    local replaces_id = accepted and accepted.id or draft.replaces_id
+    if replaces_id then
+        local replaced = thread.get(history, replaces_id)
+        if not replaced or replaced.role ~= "human" or replaced.parent_id ~= draft.parent_id then
+            return nil, "draft revision target is no longer active; exact parent retained"
+        end
+        if not accepted and vim.deep_equal(lines, replaced.lines) then
+            return
+        end
+    end
+    local parent_index = 0
+    if draft.parent_id then
+        for index, message in ipairs(history.messages) do
+            if message.id == draft.parent_id then
+                parent_index = index
+                break
+            end
+        end
+        if parent_index == 0 then
+            return nil, "draft parent is no longer active; exact parent retained"
+        end
+    end
+    local supersedes = {}
+    for index = parent_index + 1, #history.messages do
+        supersedes[#supersedes + 1] = history.messages[index].id
+    end
+    if replaces_id and supersedes[1] ~= replaces_id then
+        return nil, "draft revision does not replace the exact active suffix"
+    end
+    local message = {
+        id = fresh_id("message"),
+        parent_id = draft.parent_id,
+        role = "human",
+        author = author,
+        origin = origin,
+        created_at = os.time(),
+        lines = lines,
+    }
+    -- Validate all immutable fields without changing the live conversation.
+    local staged = {
+        id = history.id,
+        version = history.version,
+        messages = history.messages,
+        superseded = vim.list_extend({}, history.superseded),
+    }
+    local valid, failure = thread.rewind(staged, draft.parent_id, message, history.version)
+    if not valid then
+        return nil, failure
+    end
+    local tip = history.messages[#history.messages]
+    local capture = {
+        conversation_id = history.id,
+        base_version = history.version,
+        base_tip_id = tip and tip.id,
+        message = message,
+        version = history.version + 1,
+        supersedes = supersedes,
+        replaces_id = replaces_id,
+    }
+    captures[capture] = { data = data, draft = draft, snapshot = vim.deepcopy(capture) }
+    return capture
+end
+
+---Only the trusted caller at durable request acceptance may invoke this. All
+---captures are preflighted before publishing any history; failure changes none.
+---No callbacks/UI work occurs in the commit phase. In particular, acceptance
+---never writes, clears, closes or replaces a draft buffer, even after more edits.
+---@param batch ParleyConversation.Capture[] Original handles, not decoded JSON.
+---@return true? accepted
+---@return string? failure
+function M.accept(batch)
+    local plans, seen = {}, {}
+    for _, capture in ipairs(batch) do
+        local saved = captures[capture]
+        if not saved or not vim.deep_equal(capture, saved.snapshot) then
+            return nil, "submission capture is unknown, changed or already accepted"
+        end
+        local data, snapshot = saved.data, saved.snapshot
+        if seen[snapshot.conversation_id] then
+            return nil, "submission captures more than one draft for a conversation"
+        end
+        seen[snapshot.conversation_id] = true
+        local history = data.thread
+        local tip = history.messages[#history.messages]
+        if
+            history.id ~= snapshot.conversation_id
+            or history.version ~= snapshot.base_version
+            or (tip and tip.id) ~= snapshot.base_tip_id
+        then
+            return nil, "conversation changed after capture; accepted evidence was not retargeted"
+        end
+        local staged = {
+            id = history.id,
+            version = history.version,
+            messages = history.messages,
+            superseded = vim.list_extend({}, history.superseded),
+        }
+        local valid, failure = thread.rewind(
+            staged,
+            snapshot.message.parent_id,
+            snapshot.message,
+            snapshot.base_version
+        )
+        if not valid then
+            return nil, failure
+        end
+        plans[#plans + 1] = {
+            capture = capture,
+            saved = saved,
+            staged = staged,
+            accepted = vim.deepcopy(snapshot.message),
+        }
+    end
+    for _, plan in ipairs(plans) do
+        local data, draft = plan.saved.data, plan.saved.draft
+        local snapshot, staged = plan.saved.snapshot, plan.staged
+        data.thread.messages = staged.messages
+        data.thread.superseded = staged.superseded
+        data.thread.version = staged.version
+        draft.accepted = plan.accepted
+        -- Editing the accepted human message resumes this very buffer/undo tree.
+        -- Its parent never moves, including when post-capture edits already exist.
+        data.revisions[snapshot.message.id] = draft
+        captures[plan.capture] = nil
+    end
+    return true
+end
+
+---Atomically receive a compatible append-only batch without presentation work.
+---The host may refresh later; no draft, selection, geometry or hook changes here.
+---Preflight uses a private thread copy, including superseded-ID provenance.
+---@param data ParleyConversation
+---@param messages ParleyThread.Message[]
+---@param expected_version integer
+---@param expected_tip_id? string
+---@return true? success
+---@return string? failure
+function M.receive_batch(data, messages, expected_version, expected_tip_id)
+    if type(messages) ~= "table" or not vim.islist(messages) or #messages == 0 then
+        return nil, "incoming messages must be a nonempty dense array"
+    end
+    local history = data.thread
+    local tip = history.messages[#history.messages]
+    if history.version ~= expected_version or (tip and tip.id or nil) ~= expected_tip_id then
+        return nil, "conversation no longer has the exact submitted version/tip"
+    end
+    local proposed = vim.deepcopy(history)
+    for _, message in ipairs(messages) do
+        if type(message) ~= "table" then
+            return nil, "message must be a table"
+        end
+        for _, draft in ipairs(data.drafts) do
+            if message.id == draft.entry_id then
+                return nil, "message id belongs to an editable draft"
+            end
+        end
+        local appended, failure = thread.append(proposed, message)
+        if not appended then
+            return nil, failure
+        end
+    end
+    history.messages, history.version = proposed.messages, proposed.version
+    return true
 end
 
 ---Receive one explicitly supplied committed record. No discovery, model work,

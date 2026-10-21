@@ -7,7 +7,7 @@ local M = {}
 
 ---@class ParleyComposer.Keymaps
 ---@field accept? ParleyKeymapKeys Normal/Insert: accept locally and close.
----@field accept_normal? ParleyKeymapKeys Normal-only acceptance alias.
+---@field accept_normal? ParleyKeymapKeys Normal-only: accept locally and leave the surrounding thread.
 ---@field newline? ParleyKeymapKeys Insert: insert a newline.
 ---@field close? ParleyKeymapKeys Normal/Insert: close and retain unfinished edits.
 ---@field next? ParleyKeymapKeys Normal/Insert: visit the next note.

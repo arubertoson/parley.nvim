@@ -33,7 +33,7 @@ local api = vim.api
 ---@field keymaps? ParleyComposer.Keymaps|false Overrides for this editor; false disables all defaults.
 ---@field navigate fun(step: integer)
 ---@field changed fun() Refresh caller presentation after releasing room.
----@field closed? fun(restore: boolean) After teardown; true only for an explicit, focused exit.
+---@field closed? fun(restore: boolean, destination?: 'source') After teardown; restore is true only for an explicit, focused exit.
 ---@field draft_label? string Optional editing label; no thread/workflow state is owned here.
 ---@field managed? boolean Borrower owns geometry; measure/place never call back into its layout.
 
@@ -57,6 +57,8 @@ local api = vim.api
 ---@field bindings ParleyComposer.Mapping[] Owned until close, including partial setup.
 ---@field window integer
 ---@field resume_cursor? integer[] Unclamped insertion position, retained until first entry.
+---@field insertion_cursor? integer[] Last Insert position, retained through Esc's cursor clamp only.
+---@field insertion_clamp? integer[] Native cursor immediately after leaving Insert mode.
 ---@field group? integer Present after hook setup begins.
 ---@field display? table Bounded source/view fingerprint after our last layout.
 ---@field refreshing boolean
@@ -101,12 +103,25 @@ local function editor_available(editor)
         and api.nvim_win_get_buf(editor.window) == editor.note.buffer
 end
 
-local function remember_cursor(editor)
+local function remember_cursor(editor, event)
     if
         api.nvim_win_is_valid(editor.window)
         and api.nvim_win_get_buf(editor.window) == editor.note.buffer
     then
-        editor.note.cursor = editor.resume_cursor or api.nvim_win_get_cursor(editor.window)
+        local cursor = api.nvim_win_get_cursor(editor.window)
+        if event == "InsertLeave" and editor.insertion_cursor then
+            -- Observe Neovim's actual clamp (including multibyte characters),
+            -- rather than overwriting the insertion point with that position.
+            editor.insertion_clamp = cursor
+        elseif
+            event == "InsertLeavePre"
+            or (api.nvim_get_current_win() == editor.window and vim.fn.mode():sub(1, 1) == "i")
+        then
+            editor.insertion_cursor, editor.insertion_clamp = cursor, nil
+        elseif editor.insertion_clamp and not vim.deep_equal(cursor, editor.insertion_clamp) then
+            editor.insertion_cursor, editor.insertion_clamp = nil, nil
+        end
+        editor.note.cursor = editor.resume_cursor or editor.insertion_cursor or cursor
     end
 end
 
@@ -158,7 +173,8 @@ end
 ---rewrite native undo, submit anything, or accept an unfinished local edit.
 ---@param restore? boolean Restore the source view only for an explicit editor exit.
 ---@param expected? ParleyComposer.Editor Ignore stale host teardown of a replacement.
-function M.close(restore, expected)
+---@param destination? 'source' Explicitly leave the surrounding discussion after teardown.
+function M.close(restore, expected, destination)
     local editor = current
     if not editor or (expected ~= nil and editor ~= expected) then
         return
@@ -232,7 +248,8 @@ function M.close(restore, expected)
                     and focused
                     and current == nil
                     and source_available(editor)
-                    and api.nvim_get_current_win() == editor.source_win
+                    and api.nvim_get_current_win() == editor.source_win,
+                destination
             )
         end)
     end
@@ -613,7 +630,8 @@ local function invalidate_display()
 end
 
 ---Accept locally without submitting a turn. Exposed for user-managed mappings.
-function M.accept()
+---@param destination? 'source' Leave the surrounding discussion as well as the editor.
+function M.accept(destination)
     local editor = current
     if not editor then
         return
@@ -635,7 +653,7 @@ function M.accept()
         editor.note.saved_lines = text
         vim.bo[editor.note.buffer].modified = false
     end
-    M.close(true)
+    M.close(true, editor, destination)
 end
 
 ---Help belongs only to the focused composer; source/note navigation owns no maps.
@@ -675,7 +693,9 @@ local function install_bindings(editor)
 
     -- Install in a fixed order; later actions win if configured keys overlap.
     bind("accept", { "n", "i" }, M.accept, "save & close")
-    bind("accept_normal", { "n" }, M.accept, "save & close")
+    bind("accept_normal", { "n" }, function()
+        M.accept("source")
+    end, "save & leave thread")
     bind("newline", { "i" }, "<CR>", "new line")
     bind("close", { "n", "i" }, function()
         M.close(true)
@@ -708,15 +728,18 @@ end
 
 local function install_hooks(editor)
     -- Record positions while the window still exists, including external closure.
-    api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "InsertLeavePre", "BufWinLeave" }, {
-        group = editor.group,
-        buffer = editor.note.buffer,
-        callback = function()
-            if current == editor then
-                remember_cursor(editor)
-            end
-        end,
-    })
+    api.nvim_create_autocmd(
+        { "CursorMoved", "CursorMovedI", "InsertLeavePre", "InsertLeave", "BufWinLeave" },
+        {
+            group = editor.group,
+            buffer = editor.note.buffer,
+            callback = function(event)
+                if current == editor then
+                    remember_cursor(editor, event.event)
+                end
+            end,
+        }
+    )
     api.nvim_create_autocmd("ColorScheme", {
         group = editor.group,
         callback = style.refresh,

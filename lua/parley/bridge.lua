@@ -74,19 +74,33 @@ function M.status()
     })
 end
 
+---@return boolean changed Whether a state change was published and any error notified.
 local function report(state, err)
     if status.state == state and status.error == err then
-        return
+        return false
     end
     status.state, status.error = state, err
     api.nvim_exec_autocmds("User", { pattern = "ParleyBridgeChanged", data = M.status() })
     if err then
         vim.notify("Parley: " .. err, vim.log.levels.WARN)
     end
+    return true
 end
 
-local function matches(identity, endpoint, nonce)
+local function matches(identity, endpoint, nonce, with_data)
+    if type(identity) ~= "table" or vim.islist(identity) then
+        return false
+    end
+    local count = 0
+    for _ in pairs(identity) do
+        count = count + 1
+    end
     return type(identity) == "table"
+        and count == (with_data and 8 or 7)
+        and type(identity.pid) == "number"
+        and identity.pid > 0
+        and identity.pid <= 9007199254740991
+        and identity.pid % 1 == 0
         and identity.version == 1
         and identity.workspace == endpoint.workspace
         and identity.editorId == editor_id
@@ -308,6 +322,7 @@ local function attach(endpoint, token, done)
             or pipe ~= connection
             or message.workspace ~= endpoint.workspace
             or message.action ~= actions.ping
+            or message.reviewId ~= nil
             or type(p) ~= "table"
             or type(p.nonce) ~= "string"
             or p.nonce ~= message.requestId
@@ -352,6 +367,58 @@ function M.ping(done)
             status.last_result = { requestId = request_id, result = identity }
         end
         done(identity and { requestId = request_id, result = identity } or nil, err)
+    end, endpoint.workspace)
+end
+
+---One correlated application request on the verified socket; never discovers,
+---rebinds or retries. Payload/result data remain the interaction owner's policy.
+---@param action string
+---@param review_id string?
+---@param data table<string, unknown>
+---@param done fun(result: table?, err: string?)
+function M.request(action, review_id, data, done)
+    local owner, endpoint, token = pipe, binding, generation
+    if stopped or not owner or owner.closed or not endpoint or status.state ~= "connected" then
+        done(nil, "Review is not connected; no request sent")
+        return
+    end
+    local p = payload(endpoint)
+    for key, value in pairs(data) do
+        if p[key] ~= nil then
+            done(nil, "Interaction payload cannot replace pairing identity")
+            return
+        end
+        p[key] = value
+    end
+    owner.request(action, review_id, p, function(result, err)
+        if generation ~= token or pipe ~= owner or binding ~= endpoint then
+            done(nil, "Pairing changed; delivery may be unknown. No replay performed.")
+            return
+        end
+        if err then
+            done(nil, err)
+            return
+        end
+        local count = 0
+        if type(result) == "table" then
+            for _ in pairs(result) do
+                count = count + 1
+            end
+        end
+        if
+            count ~= 8
+            or not matches(result, endpoint, p.nonce, true)
+            or type(result.pid) ~= "number"
+            or result.pid <= 0
+            or result.pid % 1 ~= 0
+            or type(result.data) ~= "table"
+            or vim.islist(result.data)
+        then
+            owner.close("Invalid review response identity/envelope; no replay")
+            done(nil, "Invalid review response identity/envelope; delivery may be unknown")
+            return
+        end
+        done(result.data)
     end, endpoint.workspace)
 end
 
@@ -410,16 +477,17 @@ local function tick()
 end
 
 local function reject(reason)
-    if binding then
-        vim.notify("Parley: " .. reason, vim.log.levels.WARN)
-    else
-        report("unavailable", reason)
+    if not binding and report("unavailable", reason) then
+        return
     end
+    -- Explicit attempts always get feedback; passive health reports stay deduplicated.
+    vim.notify("Parley: " .. reason, vim.log.levels.WARN)
 end
 
 ---Discover once, verify, then activate only if the original source is still
 ---focused/available. No offer means an immediate failure, not background waiting.
-function M.activate()
+function M.activate(workflow)
+    workflow = workflow or "review"
     if busy or releasing then
         vim.notify("Parley: pairing or editor release is still in progress", vim.log.levels.WARN)
         return
@@ -441,7 +509,11 @@ function M.activate()
         reject(":ReviewStop before pairing another workspace/Pi session")
         return
     end
-    local selected = { workspace = endpoint.workspace, sessionId = endpoint.sessionId }
+    local selected = {
+        workspace = endpoint.workspace,
+        sessionId = endpoint.sessionId,
+        editorId = editor_id,
+    }
     local ready, reason = workspace.can_activate(selected)
     if not ready then
         reject(reason)
@@ -452,9 +524,13 @@ function M.activate()
         local activated, activate_err = workspace.activate({
             workspace = binding.workspace,
             sessionId = binding.sessionId,
+            editorId = editor_id,
         })
         if not activated then
             report("unavailable", activate_err)
+        else
+            workspace.allow_review_selection()
+            require("parley.interaction").select_prepared(workflow)
         end
         return
     end
@@ -506,6 +582,9 @@ function M.activate()
                     end
                 end
                 activated, activate_err = workspace.activate(selected)
+                if activated then
+                    workspace.allow_review_selection()
+                end
                 if stopped or generation ~= token or not activated then
                     return
                 end
@@ -515,6 +594,7 @@ function M.activate()
                 end
                 report("connected")
             end)
+            require("parley.interaction").select_prepared(workflow)
             if stopped or generation ~= token then
                 if not completed then
                     error(activation_failure, 0)

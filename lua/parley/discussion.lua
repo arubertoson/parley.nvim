@@ -15,6 +15,7 @@ local heading_namespace
 ---@field created_at integer
 ---@field parent_id? string Fixed by the host when this separate human draft is created.
 ---@field replaces_id? string Committed human message copied into this draft, never edited in place.
+---@field accepted? ParleyThread.Message Last accepted capture from this buffer; later edits stay local.
 
 ---@class ParleyDiscussion.State
 ---@field selected_id? string
@@ -77,7 +78,7 @@ local defaults = {
     toggle = "za",
     reply = "r",
     edit = { "e", "<CR>" },
-    close = "<Esc>",
+    close = { "q", "<Esc>" },
 }
 
 ---@param overrides? ParleyDiscussion.Keymaps|false
@@ -293,7 +294,24 @@ local function render_lines(reader, lines, heading_highlight)
         return
     end
     vim.bo[reader.buffer].modifiable = true
-    api.nvim_buf_set_lines(reader.buffer, 0, -1, false, lines)
+    local heading_only = reader.rendered and #reader.rendered == #lines
+    if heading_only then
+        for index = 2, #lines do
+            if reader.rendered[index] ~= lines[index] then
+                heading_only = false
+                break
+            end
+        end
+    end
+    -- Incoming history changes the count/index heading, not the selected body.
+    -- Replacing the whole buffer here would reset a reader's cursor/scroll.
+    api.nvim_buf_set_lines(
+        reader.buffer,
+        0,
+        heading_only and 1 or -1,
+        false,
+        heading_only and { lines[1] } or lines
+    )
     vim.bo[reader.buffer].modifiable = false
     vim.bo[reader.buffer].modified = false
     reader.rendered = lines
@@ -540,6 +558,16 @@ local function layout(view, reveal)
     return true
 end
 
+-- Headers are display chrome, not a reading/cursor target. A collapsed card
+-- contains only its heading; expanded messages and parent context start below it.
+---@param reader ParleyDiscussion.Reader
+local function keep_cursor_in_body(reader)
+    local cursor = api.nvim_win_get_cursor(reader.window)
+    if cursor[1] == 1 and api.nvim_buf_line_count(reader.buffer) > 1 then
+        api.nvim_win_set_cursor(reader.window, { 2, 0 })
+    end
+end
+
 -- Navigation restoration belongs to explicit transitions, never geometry.
 local function restore_position(view)
     for _, reader in ipairs({ view, view.parent }) do
@@ -550,8 +578,9 @@ local function restore_position(view)
             api.nvim_win_call(reader.window, function()
                 vim.fn.winrestview(
                     view.state.positions[reader.rendered_id]
-                        or { lnum = 1, col = 0, topline = 1, topfill = 0 }
+                        or { lnum = 2, col = 0, topline = 1, topfill = 0 }
                 )
+                keep_cursor_in_body(reader)
             end)
         end
     end
@@ -694,7 +723,11 @@ local function compose(view, draft)
                     restore_position(view)
                 end
             end,
-            closed = function(restore)
+            closed = function(restore, destination)
+                if destination == "source" then
+                    M.close(view, restore)
+                    return
+                end
                 if
                     restore
                     and display_available(view)
@@ -788,7 +821,10 @@ function M.edit(view)
         return false
     end
     local draft = view.options.edit(message.id)
-    assert(draft.replaces_id == message.id, "Parley: revision draft has a different target")
+    assert(
+        draft.replaces_id == message.id or (draft.accepted and draft.accepted.id == message.id),
+        "Parley: revision draft has a different target"
+    )
     assert(draft.parent_id == message.parent_id, "Parley: revision draft has a different parent")
     return compose(view, draft)
 end
@@ -1000,6 +1036,12 @@ function M.open(data, options)
         api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
             group = view.group,
             callback = function()
+                local focused = api.nvim_get_current_win()
+                if focused == view.window then
+                    keep_cursor_in_body(view)
+                elseif focused == view.parent.window then
+                    keep_cursor_in_body(view.parent)
+                end
                 if attachment_active(view) ~= view.emphasized then
                     schedule_update(view)
                 end

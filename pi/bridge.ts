@@ -1,17 +1,42 @@
 // The interactive Pi process owns this workspace lease and mechanical socket.
-// No review records, models, session switching or retained-work recovery live here.
+// Review policy is dispatched only for a verified selected peer, outside this
+// mechanical transport. No models, session switching or recovery live here.
 import net from "node:net";
 import { promises as fs } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { stateDirectory } from "./paths.ts";
+
+const reviewActions = [
+  "review-info",
+  "review-batch-begin",
+  "review-batch-chunk",
+  "review-batch-commit",
+  "review-result-begin",
+  "review-result-chunk",
+  "review-result-receipt",
+  "review-finish-begin",
+  "review-finish-status",
+] as const;
 
 const actions = {
   attach: "bridge-attach",
   ping: "bridge-ping",
   detach: "bridge-detach",
 } as const;
+
+export const frameBytes = 64 * 1024;
+export type ReviewAction = typeof reviewActions[number];
+export type ReviewPeerRequest = {
+  readonly action: ReviewAction;
+  readonly reviewId: unknown;
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly peer: EditorPeer;
+  // Invalidated by disconnect, detach, replacement or shutdown, across await.
+  readonly current: () => boolean;
+};
 
 export type EditorPeer = {
   readonly editorId: string;
@@ -28,7 +53,7 @@ type WorkspaceIdentity = {
 };
 
 // Verification accepts only this identity result; there are no model-turn results.
-type ResultIdentity = Readonly<Record<string, unknown>> & {
+type VerificationIdentity = {
   readonly version: 1;
   readonly nonce: string;
   readonly editorId: string;
@@ -37,22 +62,35 @@ type ResultIdentity = Readonly<Record<string, unknown>> & {
   readonly workspace: string;
 };
 
-type Response = Readonly<Record<string, unknown>> & {
+// The envelope is checked here; action-specific payloads remain untrusted.
+type RequestEnvelope = {
+  readonly action: unknown;
+  readonly workspace: unknown;
+  readonly payload: unknown;
+  readonly reviewId?: unknown;
+};
+
+type ResponseEnvelope = {
   readonly version: 1;
   readonly requestId: string;
-  readonly ok: boolean;
 };
+
+type Response = ResponseEnvelope & (
+  | { readonly ok: true; readonly result: unknown }
+  | { readonly ok: false; readonly error: string }
+);
 
 type RequestResult = WorkspaceIdentity & {
   readonly editorId: string;
   readonly nonce: string;
+  readonly data?: Readonly<Record<string, unknown>>;
 };
 
-type PendingRequest = {
+type PendingVerification = {
   readonly socket: net.Socket;
   readonly peer: EditorPeer;
   readonly timer: ReturnType<typeof setTimeout>;
-  readonly resolve: (result: ResultIdentity) => void;
+  readonly resolve: (result: VerificationIdentity) => void;
   readonly reject: (error: Error) => void;
 };
 
@@ -63,16 +101,30 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value as Record<string, unknown>;
 }
 
-function isIdentifier(value: unknown): value is string {
-  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
+function exactKeys(value: Readonly<Record<string, unknown>>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 }
 
-function stateDirectory(): string {
-  if (process.env.PARLEY_STATE_DIR) {
-    return process.env.PARLEY_STATE_DIR;
+function isReviewAction(value: unknown): value is ReviewAction {
+  return reviewActions.some(action => action === value);
+}
+
+function parseResponse(message: Readonly<Record<string, unknown>>, requestId: string, ok: boolean): Response {
+  const keys = ok ? ["version", "requestId", "ok", "result"] : ["version", "requestId", "ok", "error"];
+  if (!exactKeys(message, keys)) {
+    throw new Error("Invalid bridge response fields");
   }
-  const stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local/state");
-  return path.join(stateHome, "parley");
+  if (ok) {
+    return { version: 1, requestId, ok: true, result: message.result };
+  }
+  if (typeof message.error !== "string") {
+    throw new Error("Invalid bridge failure text");
+  }
+  return { version: 1, requestId, ok: false, error: message.error };
+}
+
+function isIdentifier(value: unknown): value is string {
+  return typeof value === "string" && /^[a-zA-Z0-9_-]{1,128}$/.test(value);
 }
 
 // Match Neovim's filesystem-only discovery; this does not run Git/jj or capture text.
@@ -111,10 +163,11 @@ export class WorkspaceBridge {
   private server?: net.Server;
   private readonly sockets = new Set<net.Socket>();
   private readonly peers = new Map<net.Socket, EditorPeer>();
+  private readonly verified = new Set<net.Socket>();
   // Retain the chosen editor through disconnects. Only its explicit detach (or
   // withdrawing this offer) releases the slot; another editor cannot steal it.
   private editor?: EditorPeer;
-  private readonly pending = new Map<string, PendingRequest>();
+  private readonly pendingVerifications = new Map<string, PendingVerification>();
   private readonly instanceId = randomUUID();
   private readonly lease: string;
   private runtime?: string;
@@ -123,6 +176,7 @@ export class WorkspaceBridge {
   private closing?: Promise<void>;
   onPeersChanged: () => void = () => {};
   onFailure: (error: Error) => void = () => {};
+  onReviewRequest?: (request: ReviewPeerRequest) => Promise<Readonly<Record<string, unknown>>>;
 
   constructor(readonly root: string, readonly sessionId: string) {
     const endpointsDirectory = path.join(stateDirectory(), "endpoints");
@@ -140,7 +194,7 @@ export class WorkspaceBridge {
     };
   }
 
-  async start(): Promise<void> {
+  private async acquireLease(): Promise<void> {
     await fs.mkdir(path.dirname(this.lease), { recursive: true, mode: 0o700 });
     // Exclusive guard prevents contenders from removing a newly acquired lease.
     const guardPath = this.lease + ".acquiring";
@@ -194,6 +248,10 @@ export class WorkspaceBridge {
       await guard.close();
       await fs.unlink(guardPath);
     }
+  }
+
+  async start(): Promise<void> {
+    await this.acquireLease();
     try {
       this.runtime = await fs.mkdtemp(path.join(os.tmpdir(), "parley-"));
       await fs.chmod(this.runtime, 0o700);
@@ -252,13 +310,13 @@ export class WorkspaceBridge {
     }
     const [socket, peer] = matches[0];
     const requestId = randomUUID();
-    await new Promise<ResultIdentity>((resolve, reject) => {
+    await new Promise<VerificationIdentity>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(requestId);
+        this.pendingVerifications.delete(requestId);
         reject(new Error(`Editor result timed out for ${requestId}; delivery unknown. Check Neovim review status; no automatic replay.`));
         socket.destroy();
       }, 10_000);
-      this.pending.set(requestId, { socket, peer, timer, resolve, reject });
+      this.pendingVerifications.set(requestId, { socket, peer, timer, resolve, reject });
       this.send(socket, {
         version: 1,
         requestId,
@@ -269,9 +327,10 @@ export class WorkspaceBridge {
     });
   }
 
-  private matchesIdentity(value: unknown, requestId: string, peer: EditorPeer): value is ResultIdentity {
+  private matchesIdentity(value: unknown, requestId: string, peer: EditorPeer): value is VerificationIdentity {
     const result = asRecord(value);
     return result !== undefined
+      && exactKeys(result, ["version", "nonce", "editorId", "instanceId", "sessionId", "workspace"])
       && result.version === 1
       && result.nonce === requestId
       && result.editorId === peer.editorId
@@ -287,12 +346,13 @@ export class WorkspaceBridge {
     client.on("error", () => client.destroy());
     client.on("close", () => {
       this.sockets.delete(client);
-      for (const [requestId, entry] of this.pending) {
+      this.verified.delete(client);
+      for (const [requestId, entry] of this.pendingVerifications) {
         if (entry.socket !== client) {
           continue;
         }
         clearTimeout(entry.timer);
-        this.pending.delete(requestId);
+        this.pendingVerifications.delete(requestId);
         entry.reject(new Error(`Editor disconnected before result for ${requestId}; delivery unknown. No automatic replay.`));
       }
       if (this.peers.delete(client)) {
@@ -306,17 +366,22 @@ export class WorkspaceBridge {
     let buffer = "";
     client.on("data", (chunk: string) => {
       buffer += chunk;
-      if (Buffer.byteLength(buffer) > 64 * 1024) {
-        client.destroy();
-        return;
-      }
       for (;;) {
         const end = buffer.indexOf("\n");
         if (end < 0) {
+          if (Buffer.byteLength(buffer) > frameBytes) {
+            this.send(client, { version: 1, requestId: "invalid", ok: false, error: "Bridge frame exceeds 64 KiB; no truncation or replay" });
+            client.end();
+          }
           break;
         }
         const line = buffer.slice(0, end);
         buffer = buffer.slice(end + 1);
+        if (Buffer.byteLength(line) > frameBytes) {
+          this.send(client, { version: 1, requestId: "invalid", ok: false, error: "Bridge frame exceeds 64 KiB; no truncation or replay" });
+          client.end();
+          return;
+        }
         void this.handleMessage(client, line).catch(error => {
           // A reporting failure must still close this peer, not the offer.
           client.destroy();
@@ -342,10 +407,22 @@ export class WorkspaceBridge {
       }
       requestId = message.requestId;
       if (typeof message.ok === "boolean") {
-        this.handleResponse(client, { ...message, version: 1, requestId, ok: message.ok });
+        this.handleResponse(client, parseResponse(message, requestId, message.ok));
         return;
       }
-      const result = await this.handleRequest(client, message);
+      const requestFields = ["version", "requestId", "action", "workspace", "payload"];
+      if (Object.hasOwn(message, "reviewId")) {
+        requestFields.push("reviewId");
+      }
+      if (!exactKeys(message, requestFields)) {
+        throw new Error("Invalid bridge request fields");
+      }
+      const result = await this.handleRequest(client, {
+        action: message.action,
+        workspace: message.workspace,
+        payload: message.payload,
+        reviewId: message.reviewId,
+      });
       this.send(client, { version: 1, requestId, ok: true, result });
     } catch (error) {
       this.send(client, {
@@ -358,15 +435,15 @@ export class WorkspaceBridge {
   }
 
   private handleResponse(client: net.Socket, message: Response): void {
-    const entry = this.pending.get(message.requestId);
+    const entry = this.pendingVerifications.get(message.requestId);
     if (!entry || entry.socket !== client || this.peers.get(client) !== entry.peer) {
       client.destroy();
       return;
     }
     clearTimeout(entry.timer);
-    this.pending.delete(message.requestId);
+    this.pendingVerifications.delete(message.requestId);
     if (!message.ok) {
-      entry.reject(new Error(typeof message.error === "string" ? message.error : "Editor rejected bridge verification"));
+      entry.reject(new Error(message.error));
     } else if (!this.matchesIdentity(message.result, message.requestId, entry.peer)) {
       entry.reject(new Error("Editor result identity mismatch"));
       client.destroy();
@@ -375,52 +452,45 @@ export class WorkspaceBridge {
     }
   }
 
-  private async handleRequest(client: net.Socket, message: Readonly<Record<string, unknown>>): Promise<RequestResult> {
+  private async handleRequest(client: net.Socket, message: RequestEnvelope): Promise<RequestResult> {
     const payload = asRecord(message.payload);
     const editorId = payload?.editorId;
-    if (message.workspace !== this.root
-      || payload?.instanceId !== this.instanceId
-      || payload?.sessionId !== this.sessionId
+    if (!payload
+      || message.workspace !== this.root
+      || payload.instanceId !== this.instanceId
+      || payload.sessionId !== this.sessionId
       || !isIdentifier(editorId)
-      || !isIdentifier(payload?.nonce)) {
+      || !isIdentifier(payload.nonce)) {
       throw new Error("Bridge identity changed; rediscover and explicitly rebind if the session changed");
+    }
+    const peer = this.peers.get(client);
+    if (isReviewAction(message.action)) {
+      if (!peer
+        || !this.verified.has(client)
+        || this.editor?.editorId !== editorId
+        || peer.editorId !== editorId
+        || !this.onReviewRequest) {
+        throw new Error("Review interaction requires the verified selected editor and an initialized review host");
+      }
+      const current = (): boolean => !this.stopping
+        && !client.destroyed
+        && this.peers.get(client) === peer
+        && this.verified.has(client)
+        && this.editor?.editorId === peer.editorId;
+      const data = await this.onReviewRequest({ action: message.action, reviewId: message.reviewId, payload, peer, current });
+      if (!current()) {
+        throw new Error("Review peer changed during request; delivery may be unknown. No automatic replay.");
+      }
+      return { ...this.identity(), editorId, nonce: payload.nonce, data };
+    }
+    const identityFields = ["instanceId", "sessionId", "editorId", "nonce"];
+    const payloadFields = message.action === actions.attach ? [...identityFields, "label"] : identityFields;
+    if (message.reviewId !== undefined || !exactKeys(payload, payloadFields)) {
+      throw new Error("Invalid bridge identity payload fields");
     }
     switch (message.action) {
       case actions.attach: {
-        const label = payload?.label;
-        if (typeof label !== "string" || label.length > 512) {
-          throw new Error("Invalid editor label");
-        }
-        if (this.editor && this.editor.editorId !== editorId) {
-          throw new Error("Another Neovim owns this review; :ReviewStop there before pairing another editor");
-        }
-        if (this.peers.size > 0) {
-          throw new Error("The selected editor already has a live connection; no connection replaced");
-        }
-        const peer = {
-          editorId,
-          sessionId: this.sessionId,
-          label: label.replace(/[\x00-\x1f\x7f]/g, " "),
-        };
-        // The retained object also identifies this claim's lifetime: an old
-        // failed verification must never clear a replacement claim.
-        this.editor ??= peer;
-        this.peers.set(client, peer);
-        try {
-          await this.verifyEditor(editorId);
-          if (client.destroyed || this.peers.get(client) !== peer) {
-            throw new Error("Editor disconnected during pairing");
-          }
-          this.onPeersChanged();
-        } catch (error) {
-          if (this.peers.get(client) === peer) {
-            this.peers.delete(client);
-          }
-          if (this.editor === peer && this.peers.size === 0) {
-            this.editor = undefined;
-          }
-          throw error;
-        }
+        await this.attachEditor(client, editorId, payload.label);
         break;
       }
       case actions.detach: {
@@ -430,11 +500,12 @@ export class WorkspaceBridge {
         }
         this.peers.delete(client);
         this.editor = undefined;
+        this.verified.delete(client);
         this.onPeersChanged();
         break;
       }
       case actions.ping: {
-        if (this.peers.get(client)?.editorId !== editorId || !isIdentifier(payload?.nonce)) {
+        if (this.peers.get(client)?.editorId !== editorId) {
           throw new Error("Attach before pinging this Pi session");
         }
         break;
@@ -442,7 +513,44 @@ export class WorkspaceBridge {
       default:
         throw new Error("Unsupported bridge request");
     }
-    return { ...this.identity(), editorId, nonce: payload?.nonce };
+    return { ...this.identity(), editorId, nonce: payload.nonce };
+  }
+
+  private async attachEditor(client: net.Socket, editorId: string, label: unknown): Promise<void> {
+    if (typeof label !== "string" || label.length > 512) {
+      throw new Error("Invalid editor label");
+    }
+    if (this.editor && this.editor.editorId !== editorId) {
+      throw new Error("Another Neovim owns this review; :ReviewStop there before pairing another editor");
+    }
+    if (this.peers.size > 0) {
+      throw new Error("The selected editor already has a live connection; no connection replaced");
+    }
+    const peer: EditorPeer = {
+      editorId,
+      sessionId: this.sessionId,
+      label: label.replace(/[\x00-\x1f\x7f]/g, " "),
+    };
+    // The retained object also identifies this claim's lifetime: an old
+    // failed verification must never clear a replacement claim.
+    this.editor ??= peer;
+    this.peers.set(client, peer);
+    try {
+      await this.verifyEditor(editorId);
+      if (client.destroyed || this.peers.get(client) !== peer) {
+        throw new Error("Editor disconnected during pairing");
+      }
+      this.verified.add(client);
+      this.onPeersChanged();
+    } catch (error) {
+      if (this.peers.get(client) === peer) {
+        this.peers.delete(client);
+      }
+      if (this.editor === peer && this.peers.size === 0) {
+        this.editor = undefined;
+      }
+      throw error;
+    }
   }
 
   private send(client: net.Socket, message: unknown): void {
@@ -450,7 +558,11 @@ export class WorkspaceBridge {
       return;
     }
     try {
-      client.write(JSON.stringify(message) + "\n", error => {
+      const encoded = JSON.stringify(message);
+      if (Buffer.byteLength(encoded) > frameBytes) {
+        throw new Error("Outgoing bridge frame exceeds 64 KiB; no truncation");
+      }
+      client.write(encoded + "\n", error => {
         if (error) {
           client.destroy();
         }

@@ -5,5 +5,5 @@
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./pi/extension.ts"] },
   "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "scripts": { "test": "node --test tests/*.test.ts" }
+  "scripts": { "test": "node --experimental-transform-types --test tests/*.test.ts" }
 }

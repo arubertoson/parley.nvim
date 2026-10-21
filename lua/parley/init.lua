@@ -19,8 +19,44 @@ function M.start()
     require("parley.bridge").activate()
 end
 
+function M.start_implementation()
+    require("parley.bridge").activate("parley")
+end
+
+function M.turn()
+    require("parley.interaction").submit("ask", nil, "parley")
+end
+
+function M.finish_implementation()
+    require("parley.interaction").done(nil, "parley")
+end
+
+function M.resolve_note(resolved)
+    workspace.resolve_note(resolved)
+end
+
 function M.stop()
     require("parley.bridge").stop()
+end
+
+function M.done(review_id)
+    require("parley.interaction").done(review_id)
+end
+
+function M.ask()
+    require("parley.interaction").submit("ask")
+end
+
+---@param instructions string
+function M.investigate(instructions)
+    require("parley.interaction").submit("investigate", instructions)
+end
+
+---Cached transport/acceptance state and host-reported acknowledged-request activity.
+---User ParleyRequestChanged carries a copy for statuslines/widgets; reads perform no I/O.
+---@return ParleyInteraction.Status
+function M.request_status()
+    return require("parley.interaction").status()
 end
 
 ---@param scope? 'line'|'range'

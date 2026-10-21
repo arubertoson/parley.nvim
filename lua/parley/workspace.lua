@@ -13,19 +13,26 @@ local api = vim.api
 ---@class ParleyWorkspace.Binding
 ---@field workspace string Canonical workspace root.
 ---@field sessionId string Pi conversation identity, independent of runtime reloads.
+---@field editorId? string Paired editor identity; required for submission provenance.
 
 ---@class ParleyWorkspace.Note: ParleyDiscussion.Draft
 ---@field conversation ParleyConversation Shared conversation data; source metadata stays here.
 ---@field path string Original workspace-relative source path.
----@field source_buf integer
----@field namespace integer Retained, invisible source anchors.
----@field anchor integer
+---@field source_buf? integer
+---@field namespace? integer Retained, invisible source anchors.
+---@field anchor? integer
+---@field observation? table Immutable imported source observation, not current placement.
 ---@field first integer Original line, identifying an unplaced note.
 ---@field context string[] Original selected lines, never refreshed on reopen.
+---@field observed_at integer Original editor observation, not submission time.
+---@field source_tick integer Original source-buffer version, including unsaved edits.
+---@field source_editor_id? string Paired editor which made the original observation.
 
 ---@class ParleyWorkspace.Drafts
 ---@field notes ParleyWorkspace.Note[] Creation order, not navigation order.
 ---@field selected? ParleyWorkspace.Note
+---@field review_id? string Durable review owner; nil until first explicit request.
+---@field workflow? 'review'|'parley' Immutable authority for this draft owner.
 
 ---@class ParleyWorkspace.Keymap
 ---@field mode string
@@ -43,6 +50,7 @@ local api = vim.api
 ---@field views table<integer, ParleyConversation.Source> Owned source attachments.
 ---@field selection? { window: integer, buffer: integer, line: integer }
 ---@field refresh_pending? boolean
+---@field selection_allowed? boolean Only explicit ReviewStart can select another review.
 
 ---@class ParleyWorkspace.Source
 ---@field review ParleyWorkspace.Active
@@ -54,8 +62,13 @@ local api = vim.api
 local active
 ---@type table<string, table<string, ParleyWorkspace.Drafts>>
 local conversations = {}
+---@type table<string, table<string, table<string, ParleyWorkspace.Drafts>>>
+local review_drafts = {}
+---@type table<table, table>
+local requests = setmetatable({}, { __mode = "k" })
 ---@type integer?
 local anchors
+local place_imported
 M.status = ""
 
 ---@param window integer
@@ -105,12 +118,15 @@ end
 
 ---Extmarks track movement, not permission to attach a note to changed text.
 local function placement(review, note)
-    if not api.nvim_buf_is_loaded(note.source_buf) then
+    if not note.source_buf or not api.nvim_buf_is_loaded(note.source_buf) then
         return
     end
 
     local filename = vim.fs.normalize(api.nvim_buf_get_name(note.source_buf))
     if filename ~= review.workspace .. "/" .. note.path then
+        return
+    end
+    if not note.namespace or not note.anchor then
         return
     end
 
@@ -155,11 +171,14 @@ local function placed_items(review, buffer)
     return items
 end
 
-local function changed()
+local function cache_status()
     local review = active
     M.status = ""
     if review then
         M.status = ("Workspace review · %d notes"):format(#review.drafts.notes)
+        if review.drafts.workflow == "parley" then
+            M.status = ("Parley implementation · %d notes"):format(#review.drafts.notes)
+        end
         local note = review.drafts.selected
         if note then
             local first = placement(review, note)
@@ -168,7 +187,10 @@ local function changed()
             M.status = M.status .. position .. (first and "" or " · unplaced")
         end
     end
+end
 
+local function changed()
+    cache_status()
     api.nvim_exec_autocmds(
         "User",
         { pattern = "ParleyReviewChanged", data = { status = M.status } }
@@ -209,6 +231,11 @@ local function current_source()
         return
     end
 
+    -- An explicit source action can now place an imported observation which was
+    -- previously unloaded/unsaved. Still no relocation or source opening.
+    for _, note in ipairs(review.drafts.notes) do
+        place_imported(review, note, buffer)
+    end
     -- Explicit entry cannot rely on a scheduled TextChanged refresh having run.
     local view = review.views[window]
     if view then
@@ -304,6 +331,9 @@ local function associate(review, window, data, first, last)
     note.namespace, note.anchor = anchors, anchor
     note.first = first
     note.context = api.nvim_buf_get_lines(buffer, first - 1, last, false)
+    note.observed_at = os.time()
+    note.source_tick = api.nvim_buf_get_changedtick(buffer)
+    note.source_editor_id = review.editorId
     review.drafts.notes[#review.drafts.notes + 1] = note
 end
 
@@ -343,6 +373,702 @@ function M.add_conversation(seed, first, last)
     return data
 end
 
+local function identifier(value)
+    return type(value) == "string"
+        and #value >= 1
+        and #value <= 128
+        and value:match("^[A-Za-z0-9_-]+$") ~= nil
+end
+
+-- Missing/deleted sources retain evidence, not a guessed new association.
+local function source_contained(root, path)
+    if type(path) ~= "string" or path == "" then
+        return nil, "invalid workspace-relative source path"
+    end
+    if
+        path:find("[\\%c]")
+        or path:sub(1, 1) == "/"
+        or path:match("^%a:")
+        or path:sub(-1) == "/"
+        or path:find("//", 1, true)
+    then
+        return nil, "invalid workspace-relative source path"
+    end
+    for part in path:gmatch("[^/]+") do
+        if part == "." or part == ".." or part == ".git" or part == ".jj" then
+            return nil, "invalid workspace-relative source path"
+        end
+    end
+    local filename = root .. "/" .. path
+    while true do
+        local resolved, failure, code = vim.uv.fs_realpath(filename)
+        if resolved then
+            if resolved ~= root and resolved:sub(1, #root + 1) ~= root .. "/" then
+                return nil, "source resolves outside the workspace"
+            end
+            local relative = resolved:sub(#root + 2)
+            for part in relative:gmatch("[^/]+") do
+                if part == ".git" or part == ".jj" then
+                    return nil, "source resolves into repository metadata"
+                end
+            end
+            return true
+        end
+        if code ~= "ENOENT" then
+            return nil, "cannot validate source containment: " .. tostring(failure)
+        end
+        -- Deleted files can retain their observation. Unresolvable symlinks
+        -- cannot be treated as deleted ordinary files or silently followed.
+        local stat, stat_failure, stat_code = vim.uv.fs_lstat(filename)
+        if stat or stat_code ~= "ENOENT" then
+            return nil, "cannot validate missing source: " .. tostring(stat_failure or failure)
+        end
+        filename = vim.fs.dirname(filename)
+        if not filename or #filename < #root then
+            return nil, "cannot validate workspace source containment"
+        end
+    end
+end
+
+local function capture_anchor(review, note, editor_id)
+    local contained, failure = source_contained(review.workspace, note.path)
+    if not contained then
+        return nil, failure
+    end
+    if note.observation then
+        -- A disk observation does not become an editor observation on reply.
+        return vim.deepcopy(note.observation)
+    end
+    if not note.observed_at or not note.source_tick or not note.source_editor_id then
+        return nil, "original source observation is unavailable; draft retained"
+    end
+    if note.source_editor_id ~= editor_id then
+        return nil, "source observation belongs to a different editor; draft retained"
+    end
+    return {
+        path = note.path,
+        side = "workspace",
+        first = note.first,
+        last = note.first + #note.context - 1,
+        lines = vim.list_extend({}, note.context),
+        observedAt = note.observed_at,
+        source = {
+            kind = "editor",
+            editorId = note.source_editor_id,
+            bufferId = note.source_buf,
+            changedTick = note.source_tick,
+        },
+    }
+end
+
+-- A disk-origin finding may acquire an anchor only in an already loaded,
+-- unmodified buffer, at its original coordinates. Never load a source here.
+-- Compare disk and buffer independently: an unsaved buffer is not disk evidence.
+place_imported = function(review, note, buffer)
+    local observed = note.observation
+    if active ~= review then
+        return
+    end
+    if
+        (note.source_buf and api.nvim_buf_is_valid(note.source_buf))
+        or not observed
+        or observed.side ~= "workspace"
+        or observed.source.kind ~= "disk"
+        or not api.nvim_buf_is_loaded(buffer)
+        or vim.bo[buffer].buftype ~= ""
+        or vim.bo[buffer].modified
+        or api.nvim_buf_get_name(buffer) ~= review.workspace .. "/" .. note.path
+        or not source_contained(review.workspace, note.path)
+    then
+        return
+    end
+    local filename = vim.uv.fs_realpath(review.workspace .. "/" .. note.path)
+    if not filename then
+        return
+    end
+    local before = vim.uv.fs_lstat(filename)
+    if not before or before.type ~= "file" or before.size > 1024 * 1024 then
+        return
+    end
+    local fd = vim.uv.fs_open(filename, "r", 0)
+    if not fd then
+        return
+    end
+    local checked, unchanged = pcall(function()
+        local opened = vim.uv.fs_fstat(fd)
+        if
+            not opened
+            or opened.type ~= "file"
+            or opened.dev ~= before.dev
+            or opened.ino ~= before.ino
+            or opened.size ~= before.size
+        then
+            return false
+        end
+        local bytes = vim.uv.fs_read(fd, before.size + 1, 0)
+        local after = vim.uv.fs_fstat(fd)
+        local named = vim.uv.fs_stat(review.workspace .. "/" .. note.path)
+        if
+            not bytes
+            or #bytes ~= before.size
+            or not after
+            or not named
+            or opened.dev ~= after.dev
+            or opened.ino ~= after.ino
+            or opened.size ~= after.size
+            or not vim.deep_equal(opened.mtime, after.mtime)
+            or not vim.deep_equal(opened.ctime, after.ctime)
+            or named.dev ~= after.dev
+            or named.ino ~= after.ino
+            or named.size ~= after.size
+            or not vim.deep_equal(named.mtime, after.mtime)
+            or not source_contained(review.workspace, note.path)
+        then
+            return false
+        end
+        local disk = vim.split(bytes, "\n", { plain = true })
+        if disk[#disk] == "" then
+            table.remove(disk)
+        end
+        if observed.last > #disk or observed.last > api.nvim_buf_line_count(buffer) then
+            return false
+        end
+        for index, line in ipairs(observed.lines) do
+            if disk[observed.first + index - 1] ~= line then
+                return false
+            end
+        end
+        return vim.deep_equal(
+            api.nvim_buf_get_lines(buffer, observed.first - 1, observed.last, false),
+            observed.lines
+        )
+    end)
+    local closed = vim.uv.fs_close(fd)
+    if not checked or not unchanged or not closed then
+        return
+    end
+    anchors = anchors or api.nvim_create_namespace("parley.anchors")
+    -- A wiped buffer has lost its anchors. Reopening may establish a new one
+    -- only after the same disk and buffer observation checks above.
+    local mark = api.nvim_buf_set_extmark(buffer, anchors, observed.first - 1, 0, {
+        end_row = observed.last,
+        end_col = 0,
+        right_gravity = true,
+        end_right_gravity = false,
+        invalidate = true,
+        undo_restore = true,
+    })
+    note.source_buf, note.namespace, note.anchor = buffer, anchors, mark
+end
+
+local function fields(value, names)
+    if type(value) ~= "table" or vim.islist(value) then
+        return false
+    end
+    local count = 0
+    for _ in pairs(value) do
+        count = count + 1
+    end
+    for _, name in ipairs(names) do
+        if value[name] == nil then
+            return false
+        end
+    end
+    return count == #names
+end
+
+local function integer(value, minimum)
+    return type(value) == "number"
+        and value >= minimum
+        and value <= 9007199254740991
+        and value % 1 == 0
+end
+
+local function lines(value)
+    if type(value) ~= "table" or not vim.islist(value) or #value == 0 then
+        return false
+    end
+    for _, line in ipairs(value) do
+        if type(line) ~= "string" or line:find("\n", 1, true) then
+            return false
+        end
+    end
+    return true
+end
+
+local function valid_observation(anchor)
+    if
+        not fields(anchor, { "path", "side", "first", "last", "lines", "observedAt", "source" })
+        or (anchor.side ~= "workspace" and anchor.side ~= "base")
+        or not integer(anchor.first, 1)
+        or not integer(anchor.last, anchor.first)
+        or not integer(anchor.observedAt, 0)
+        or not lines(anchor.lines)
+        or #anchor.lines ~= anchor.last - anchor.first + 1
+    then
+        return false
+    end
+    local source = anchor.source
+    if fields(source, { "kind" }) and source.kind == "disk" then
+        return anchor.side == "workspace"
+    end
+    if fields(source, { "kind", "commit" }) and source.kind == "commit" then
+        return anchor.side == "base"
+            and type(source.commit) == "string"
+            and source.commit:find("%S") ~= nil
+    end
+    return fields(source, { "kind", "editorId", "bufferId", "changedTick" })
+        and source.kind == "editor"
+        and anchor.side == "workspace"
+        and identifier(source.editorId)
+        and integer(source.bufferId, 1)
+        and integer(source.changedTick, 0)
+end
+
+local function publication_conflict(review, incoming)
+    for _, note in ipairs(review.drafts.notes) do
+        local history = note.conversation.thread
+        if incoming[history.id] then
+            return "publication identity belongs to an existing conversation"
+        end
+        local histories = { history.messages }
+        for _, suffix in ipairs(history.superseded) do
+            histories[#histories + 1] = suffix.messages
+        end
+        for _, messages in ipairs(histories) do
+            for _, message in ipairs(messages) do
+                if incoming[message.id] then
+                    return "publication identity already exists in local history"
+                end
+            end
+        end
+        for _, draft in ipairs(note.conversation.drafts) do
+            if incoming[draft.entry_id] then
+                return "publication identity belongs to an editable draft"
+            end
+        end
+    end
+end
+
+---Import a completed publication batch against a private accepted capture.
+---This is a background data path: no focused-source API, file opening, selection,
+---draft mutation or explicit presentation callbacks. All shapes/relations
+---are preflighted before mutation. Compatible groups apply independently; each
+---group returns an explicit application fact for the transport host to persist.
+---The one-shot handle is consumed even if a native allocation subsequently fails.
+---@param capture table Original accepted handle, never a decoded replacement.
+---@param groups table[] Wire projections of published conversations/messages.
+---@return table[]? receipts Local facts, not durable acknowledgments.
+---@return string? failure
+function M.import_results(capture, groups)
+    local saved = requests[capture]
+    if
+        not saved
+        or not saved.accepted
+        or saved.imported
+        or not vim.deep_equal(capture, saved.snapshot)
+    then
+        return nil, "missing, changed or already consumed accepted result owner"
+    end
+    if type(groups) ~= "table" or not vim.islist(groups) then
+        return nil, "result conversations must be an array"
+    end
+    local review = saved.review
+    local plans, ids = {}, {}
+    for _, group in ipairs(groups) do
+        if
+            not fields(group, { "id", "anchor", "new", "baseVersion", "baseTipId", "messages" })
+            or not identifier(group.id)
+            or ids[group.id]
+            or type(group.new) ~= "boolean"
+            or not integer(group.baseVersion, 0)
+            or not valid_observation(group.anchor)
+            or (group.baseTipId ~= vim.NIL and not identifier(group.baseTipId))
+            or type(group.messages) ~= "table"
+            or not vim.islist(group.messages)
+            or #group.messages == 0
+        then
+            return nil, "invalid/duplicate result conversation or source observation"
+        end
+        ids[group.id] = true
+        local submitted
+        for _, item in ipairs(saved.accepted.submissions) do
+            if item.conversationId == group.id then
+                submitted = item
+            end
+        end
+        if group.new then
+            if
+                submitted
+                or group.baseVersion ~= 0
+                or group.baseTipId ~= vim.NIL
+                or group.anchor.side ~= "workspace"
+                or group.anchor.source.kind ~= "disk"
+            then
+                return nil,
+                    "finding must have a new identity and an observed workspace disk anchor"
+            end
+        else
+            local captured
+            for _, item in ipairs(saved.snapshot.conversations) do
+                if item.id == group.id then
+                    captured = item
+                end
+            end
+            if
+                not submitted
+                or not captured
+                or group.baseVersion ~= submitted.version
+                or group.baseTipId ~= submitted.tipId
+                or not vim.deep_equal(group.anchor, captured.anchor)
+            then
+                return nil, "reply does not identify the exact submitted conversation/anchor"
+            end
+        end
+        local plan = { group = group, messages = {}, messageIds = {}, incoming = {} }
+        if group.new then
+            plan.incoming[group.id] = true
+        end
+        local parent = group.baseTipId
+        for index, message in ipairs(group.messages) do
+            if
+                not fields(message, {
+                    "id",
+                    "parentId",
+                    "role",
+                    "author",
+                    "origin",
+                    "createdAt",
+                    "lines",
+                    "version",
+                })
+                or not identifier(message.id)
+                or ids[message.id]
+                or message.role ~= "agent"
+                or message.parentId ~= parent
+                or message.version ~= group.baseVersion + index
+                or not integer(message.version, 1)
+                or type(message.author) ~= "string"
+                or not message.author:find("%S")
+                or type(message.origin) ~= "string"
+                or not message.origin:find("%S")
+                or not integer(message.createdAt, 0)
+                or not lines(message.lines)
+                or not table.concat(message.lines, "\n"):find("%S")
+            then
+                return nil,
+                    "invalid/duplicate publication identity, provenance or parent/version chain"
+            end
+            ids[message.id] = true
+            plan.incoming[message.id] = true
+            parent = message.id
+            plan.messages[#plan.messages + 1] = {
+                id = message.id,
+                parent_id = message.parentId ~= vim.NIL and message.parentId or nil,
+                role = message.role,
+                author = message.author,
+                origin = message.origin,
+                created_at = message.createdAt,
+                lines = vim.deepcopy(message.lines),
+            }
+            plan.messageIds[#plan.messageIds + 1] = message.id
+        end
+        -- Path/containment failures are incompatible evidence, not permission to
+        -- attach elsewhere. Keep validating the remaining groups before applying.
+        local contained, failure = source_contained(review.workspace, group.anchor.path)
+        plan.failure = not contained and failure or nil
+        plans[#plans + 1] = plan
+    end
+    saved.imported = true
+    local receipts = {}
+    for _, plan in ipairs(plans) do
+        local group = plan.group
+        local failure = saved.incompatible
+            or plan.failure
+            or publication_conflict(review, plan.incoming)
+        local data, note
+        if active ~= review then
+            failure = "accepted workspace lifetime is no longer active; no retargeting"
+        end
+        for _, candidate in ipairs(review.drafts.notes) do
+            if candidate.conversation.thread.id == group.id then
+                note, data = candidate, candidate.conversation
+            end
+        end
+        if not group.new then
+            local baseline = saved.baselines[group.id]
+            if
+                not baseline
+                or data ~= baseline.data
+                or not vim.deep_equal(data.thread, baseline.history)
+            then
+                failure =
+                    "conversation differs from exact accepted history; reply was not retargeted"
+            end
+        end
+        if not failure then
+            local ok, imported, import_failure = pcall(function()
+                if group.new then
+                    data = conversation.new({ id = group.id, messages = plan.messages })
+                    if active ~= review then
+                        error("workspace lifetime changed while allocating the finding", 0)
+                    end
+                    -- Native buffer allocation may invoke user hooks. Do not
+                    -- overwrite identities/resources those hooks just acquired.
+                    local conflict = publication_conflict(review, plan.incoming)
+                    if conflict then
+                        error(conflict, 0)
+                    end
+                    note = data.note
+                    ---@cast note ParleyWorkspace.Note
+                    note.conversation, note.path = data, group.anchor.path
+                    note.first, note.context = group.anchor.first, vim.deepcopy(group.anchor.lines)
+                    note.observation = vim.deepcopy(group.anchor)
+                    review.drafts.notes[#review.drafts.notes + 1] = note
+                    return true
+                end
+                return conversation.receive_batch(
+                    data,
+                    plan.messages,
+                    group.baseVersion,
+                    group.baseTipId
+                )
+            end)
+            if not ok or not imported then
+                failure = tostring(ok and import_failure or imported)
+            end
+        end
+        local placed
+        if not failure then
+            -- Placement is secondary to history application. A native placement
+            -- failure must not falsely label already appended prose incompatible.
+            for _, buffer in ipairs(api.nvim_list_bufs()) do
+                local ok = pcall(place_imported, review, note, buffer)
+                if not ok then
+                    break
+                end
+            end
+            local ok, first = pcall(placement, review, note)
+            placed = ok and first ~= nil
+        end
+        receipts[#receipts + 1] = {
+            messageIds = plan.messageIds,
+            status = failure and "incompatible" or "applied",
+            placement = failure and vim.NIL or (placed and "placed" or "unplaced"),
+            detail = failure and tostring(failure):sub(1, 1024)
+                or (
+                    not placed
+                        and "History retained unplaced: source is unloaded, changed, unsaved or not safely verifiable"
+                    or vim.NIL
+                ),
+        }
+    end
+    cache_status()
+    return receipts
+end
+
+---@class ParleyWorkspace.RequestOptions
+---@field id string Durable request identity, distinct from transport correlation.
+---@field kind 'ask'|'investigate'
+---@field instructions? string Required only for investigation; never implicit draft submission.
+---@field editor_id string Verified editor identity supplied by the paired host.
+---@field author string Human author identity supplied by the host.
+
+---Explicit local capture only. Ask visits every conversation in creation order,
+---not just the selected file/card. Investigation captures instructions only.
+---The copied payload uses artifact field spellings, with explicit JSON nulls;
+---the transport host supplies review/preparation/record envelopes.
+---No model, transport, acknowledgment or local history mutation occurs here.
+---@param options ParleyWorkspace.RequestOptions
+---@return table? capture Read-only, process-local handle and serializable payload.
+---@return string? failure
+function M.capture_request(options)
+    local review = active
+    if not review then
+        return nil, "activate workspace review before requesting agent interaction"
+    end
+    if not identifier(options.id) or not identifier(options.editor_id) then
+        return nil, "request and editor identities must be valid identifiers"
+    end
+    if type(options.author) ~= "string" or not options.author:find("%S") then
+        return nil, "human author must be nonempty"
+    end
+    if review.editorId ~= options.editor_id then
+        return nil, "request editor does not match the active workspace owner"
+    end
+    ---@type string|vim.NIL
+    local instructions = vim.NIL
+    if options.kind == "investigate" then
+        if type(options.instructions) ~= "string" or not options.instructions:find("%S") then
+            return nil, "investigation requires explicit instructions"
+        end
+        instructions = options.instructions
+    elseif options.kind ~= "ask" or options.instructions ~= nil then
+        return nil, "Ask captures comments; Investigate requires free-form instructions"
+    end
+    local payload = {
+        workspace = review.workspace,
+        sessionId = review.sessionId,
+        editorId = options.editor_id,
+        request = {
+            id = options.id,
+            kind = options.kind,
+            instructions = instructions,
+            submissions = {},
+        },
+        conversations = {},
+        messages = {},
+    }
+    local batch, seen = {}, {}
+    if review.drafts.workflow == "parley" then
+        for _, buffer in ipairs(api.nvim_list_bufs()) do
+            local filename = api.nvim_buf_get_name(buffer)
+            if
+                api.nvim_buf_is_loaded(buffer)
+                and vim.bo[buffer].buftype == ""
+                and filename:sub(1, #review.workspace + 1) == review.workspace .. "/"
+                and vim.bo[buffer].modified
+            then
+                return nil,
+                    "Save or reconcile modified workspace source buffers before an implementation turn"
+            end
+        end
+    end
+    if options.kind == "ask" then
+        for _, note in ipairs(review.drafts.notes) do
+            local captured, failure
+            if review.drafts.workflow ~= "parley" or not note.conversation.resolved then
+                captured, failure = conversation.capture(
+                    note.conversation,
+                    options.author,
+                    "editor/" .. options.editor_id
+                )
+            end
+            if failure then
+                return nil, note.path .. ": " .. failure
+            end
+            if captured then
+                if seen[captured.conversation_id] then
+                    return nil, "duplicate workspace conversation identity"
+                end
+                seen[captured.conversation_id] = true
+                local anchor, anchor_failure = capture_anchor(review, note, options.editor_id)
+                if not anchor then
+                    return nil, note.path .. ": " .. anchor_failure
+                end
+                local first, last = placement(review, note)
+                payload.conversations[#payload.conversations + 1] = {
+                    id = captured.conversation_id,
+                    anchor = anchor,
+                    placement = first and { first = first, last = last } or vim.NIL,
+                }
+                local message = captured.message
+                payload.messages[#payload.messages + 1] = {
+                    id = message.id,
+                    conversationId = captured.conversation_id,
+                    requestId = options.id,
+                    parentId = message.parent_id or vim.NIL,
+                    role = message.role,
+                    author = message.author,
+                    origin = message.origin,
+                    createdAt = message.created_at,
+                    lines = vim.list_extend({}, message.lines),
+                    version = captured.version,
+                    supersedes = vim.list_extend({}, captured.supersedes),
+                    replacesId = captured.replaces_id or vim.NIL,
+                }
+                payload.request.submissions[#payload.request.submissions + 1] = {
+                    conversationId = captured.conversation_id,
+                    baseVersion = captured.base_version,
+                    baseTipId = captured.base_tip_id or vim.NIL,
+                    messageIds = { message.id },
+                    version = captured.version,
+                    tipId = message.id,
+                }
+                batch[#batch + 1] = captured
+            end
+        end
+        if #batch == 0 then
+            return nil, "no new human prose is eligible for Ask"
+        end
+    end
+    requests[payload] = { snapshot = vim.deepcopy(payload), batch = batch, review = review }
+    return payload
+end
+
+---Invoke only after the host validates a durable accepting request record from
+---Pi (not socket delivery, local save or a pre-ack status). The exact accepted
+---submissions must match the private capture, including every version/tip/ID.
+---Detached owners may accept their own evidence, never a replacement's drafts.
+---Stale history fails the entire local batch, leaving durable evidence intact
+---for an incompatibility receipt; it is never retargeted or replayed here.
+---@param capture table Original capture handle.
+---@param accepted table Validated accepting request record, not transport JSON.
+---@return true? applied
+---@return string? failure
+function M.accept_request(capture, accepted)
+    local saved = requests[capture]
+    if not saved or saved.accepted or not vim.deep_equal(capture, saved.snapshot) then
+        return nil, "request capture is unknown, changed or already accepted"
+    end
+    if type(accepted) ~= "table" or accepted.type ~= "request" then
+        return nil, "durable accepting request record is required"
+    end
+    local request = {
+        id = accepted.id,
+        kind = accepted.kind,
+        instructions = accepted.instructions,
+        submissions = accepted.submissions,
+    }
+    if not vim.deep_equal(request, saved.snapshot.request) then
+        return nil, "durable acceptance does not match the exact captured request"
+    end
+    local applied, failure = conversation.accept(saved.batch)
+    saved.accepted = vim.deepcopy(accepted)
+    if not applied then
+        -- Acceptance is durable even when local history diverged. Keep this
+        -- handle solely to classify later publications as incompatible.
+        saved.incompatible, saved.baselines, saved.batch = failure, {}, nil
+        return nil, failure
+    end
+    saved.baselines = {}
+    for _, note in ipairs(saved.review.drafts.notes) do
+        for _, submitted in ipairs(accepted.submissions) do
+            if submitted.conversationId == note.conversation.thread.id then
+                saved.baselines[submitted.conversationId] = {
+                    data = note.conversation,
+                    history = vim.deepcopy(note.conversation.thread),
+                }
+            end
+        end
+    end
+    saved.batch = nil
+    return true
+end
+
+---Resolution changes only the local turn filter. History, drafts, undo and
+---selection survive. Reopening is explicit and never submits or runs tools.
+function M.resolve_note(resolved)
+    local review = active
+    if not review or review.drafts.workflow ~= "parley" then
+        vim.notify("Parley: select an implementation interaction first", vim.log.levels.WARN)
+        return
+    end
+    local note = review.drafts.selected
+    if not note then
+        vim.notify("Parley: select a conversation first", vim.log.levels.WARN)
+        return
+    end
+    note.conversation.resolved = resolved ~= false
+    refresh_sources(review)
+    changed()
+    vim.notify(
+        note.conversation.resolved and "Parley: conversation resolved; excluded from turns"
+            or "Parley: conversation reopened; drafts retained",
+        vim.log.levels.INFO
+    )
+end
+
 ---Resume a selected/overlapping note; C creates a line note only when absent.
 ---@param create? boolean
 function M.edit_note(create)
@@ -358,8 +1084,8 @@ function M.edit_note(create)
     end
 end
 
----Visit existing local notes in path/line/identity order. Unplaced notes remain in
----that sequence, without switching source buffers or guessing replacement anchors.
+---Visit existing local notes in path/line/identity order. Explicit navigation may
+---open a source; only a validated placement permits a cursor jump or source card.
 ---@param step integer
 function M.move_note(step)
     assert(step == 1 or step == -1, "Note navigation requires step 1 or -1")
@@ -368,6 +1094,7 @@ function M.move_note(step)
         return
     end
     local review = source.review
+    local drafts = review.drafts
     local notes = {}
     for _, note in ipairs(review.drafts.notes) do
         notes[#notes + 1] = { note = note, first = placement(review, note) or note.first }
@@ -437,6 +1164,7 @@ function M.move_note(step)
     end
     if
         active ~= review
+        or review.drafts ~= drafts
         or api.nvim_get_current_win() ~= source.window
         or workspace_source(review.workspace, source.window) ~= source.buffer
         or review.views[source.window] ~= view
@@ -444,27 +1172,42 @@ function M.move_note(step)
     then
         return
     end
-    if first then
-        -- Respect modified-buffer abandonment policy. Never force a source jump.
-        local switched, failure = pcall(vim.cmd.buffer, tostring(note.source_buf))
-        if not switched then
-            vim.notify("Parley: " .. tostring(failure), vim.log.levels.WARN)
-            return
-        end
-        if active ~= review then
-            return
-        end
-        if
-            api.nvim_get_current_win() ~= source.window
-            or workspace_source(review.workspace, source.window) ~= note.source_buf
-        then
-            vim.notify("Parley: source window changed during note navigation", vim.log.levels.WARN)
-            return
-        end
-        first = placement(review, note)
+    local contained, failure = source_contained(review.workspace, note.path)
+    if not contained then
+        vim.notify("Parley: " .. tostring(failure), vim.log.levels.WARN)
+        return
+    end
+    -- Opening a file belongs to explicit navigation, never background import.
+    -- Neither command forces abandonment of unsaved source changes.
+    local switched, err = pcall(function()
         if first then
-            api.nvim_win_set_cursor(source.window, { first, 0 })
+            vim.cmd.buffer(tostring(note.source_buf))
+        else
+            vim.cmd.edit(vim.fn.fnameescape(review.workspace .. "/" .. note.path))
         end
+    end)
+    if not switched then
+        vim.notify("Parley: " .. tostring(err), vim.log.levels.WARN)
+        return
+    end
+    if active ~= review or review.drafts ~= drafts then
+        return
+    end
+    local buffer, path = workspace_source(review.workspace, source.window)
+    if
+        api.nvim_get_current_win() ~= source.window
+        or path ~= note.path
+        or (first and buffer ~= note.source_buf)
+    then
+        vim.notify("Parley: source window changed during note navigation", vim.log.levels.WARN)
+        return
+    end
+    -- BufEnter may already have placed this finding. Recheck after all loading
+    -- hooks; changed/unsaved source must not acquire a guessed replacement range.
+    place_imported(review, note, buffer)
+    first = placement(review, note)
+    if first then
+        api.nvim_win_set_cursor(source.window, { first, 0 })
     end
     show(review, note, source.window, false)
 end
@@ -631,6 +1374,9 @@ local function visit_buffer(review)
             end
         end
     end
+    for _, note in ipairs(review.drafts.notes) do
+        place_imported(review, note, buffer)
+    end
     refresh_sources(review)
 end
 
@@ -678,9 +1424,11 @@ function M.activate(binding)
     local review = {
         workspace = binding.workspace,
         sessionId = binding.sessionId,
+        editorId = binding.editorId,
         group = api.nvim_create_augroup("ParleyWorkspace", { clear = true }),
         window = window,
         drafts = drafts,
+        selection_allowed = true,
         keymaps = configured,
         bindings = resolve_review_bindings(configured.review),
         maps = {},
@@ -755,6 +1503,76 @@ function M.activate(binding)
     if active ~= review then
         return false, "Workspace activation was stopped or replaced by a hook"
     end
+    return true
+end
+
+---Explicit ReviewStart permits selecting a newly initialized review on the next
+---request. Passive health/reconnection never calls this or moves drafts.
+function M.allow_review_selection()
+    if active then
+        active.selection_allowed = true
+    end
+end
+
+function M.workflow()
+    return active and active.drafts.workflow or "review"
+end
+
+function M.review_id()
+    return active and active.drafts.review_id
+end
+
+---Bind local notes once; a fresh review gets a separate retained draft set.
+---No submitted identities, native buffers, undo or old source anchors migrate.
+function M.select_review(review_id, workflow)
+    workflow = workflow or "review"
+    if workflow ~= "review" and workflow ~= "parley" then
+        return nil, "Unknown workflow authority"
+    end
+    local review = active
+    if not review then
+        return nil, "Use :ReviewStart before selecting a review"
+    end
+    if review.drafts.review_id == review_id then
+        if (review.drafts.workflow or "review") ~= workflow then
+            return nil, "Workflow authority changed for the same identity"
+        end
+        review.selection_allowed = false
+        return true
+    end
+    if review.drafts.review_id and not review.selection_allowed then
+        return nil,
+            "Review changed; run :ReviewStart explicitly to select the new review. Old notes will remain retained."
+    end
+    local sessions = review_drafts[review.workspace] or {}
+    review_drafts[review.workspace] = sessions
+    local retained = sessions[review.sessionId] or {}
+    sessions[review.sessionId] = retained
+    if retained[review_id] and (retained[review_id].workflow or "review") ~= workflow then
+        return nil, "Workflow authority changed for a retained identity"
+    end
+    if review.drafts.review_id then
+        local failed, failure
+        for _, view in pairs(review.views) do
+            local ok, err = pcall(conversation.detach, view)
+            if not ok and not failed then
+                failed, failure = true, err
+            end
+        end
+        if failed then
+            return nil, tostring(failure)
+        end
+        review.views = {}
+        review.drafts = retained[review_id]
+            or { notes = {}, review_id = review_id, workflow = workflow }
+        conversations[review.workspace][review.sessionId] = review.drafts
+    else
+        review.drafts.review_id = review_id
+        review.drafts.workflow = workflow
+    end
+    retained[review_id] = review.drafts
+    review.selection_allowed = false
+    changed()
     return true
 end
 
