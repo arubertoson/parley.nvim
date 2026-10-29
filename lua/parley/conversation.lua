@@ -36,6 +36,9 @@ end
 ---@field revisions table<string, ParleyDiscussion.Draft> Submitted human ID to copied draft.
 ---@field pending? ParleyDiscussion.Draft Only this retained editable entry is currently presented.
 ---@field state ParleyDiscussion.State Retained reading state, not canonical history.
+---@field response? ParleyDiscussion.Response Transient exact-request slot, never committed history.
+---@field resolved? boolean Editor-local submission filter; history and drafts survive.
+---@field deleted? boolean Retained locally, excluded from presentation and submission.
 
 ---@class ParleyConversation.Item
 ---@field conversation ParleyConversation
@@ -49,6 +52,7 @@ end
 ---@field state? { selected: ParleyConversation? } Retained source selection.
 ---@field keymaps? ParleyConfig.Resolved Activation-time choices; defaults to configured keys.
 ---@field source_maps? boolean False when the workspace owns its visited-buffer maps.
+---@field thread_action? fun(action: 'resolve'|'reopen'|'delete') Operate on the active thread in the host.
 ---@field enabled? fun(): boolean Explicit-entry permission; never gates cleanup.
 ---@field created? fun(data: ParleyConversation, first: integer, last: integer) Associate a new note with caller-owned source anchors.
 ---@field selected? fun(data: ParleyConversation) Update caller-owned cross-file selection.
@@ -157,9 +161,30 @@ local function revision_draft(data, id)
     return draft
 end
 
+-- Accepted text keeps its buffer and undo tree, but is not another draft entry.
+local function visible_draft(data)
+    local draft = data.pending
+    if
+        draft
+        and draft.accepted
+        and api.nvim_buf_is_loaded(draft.buffer)
+        and vim.deep_equal(
+            api.nvim_buf_get_lines(draft.buffer, 0, -1, false),
+            draft.accepted.lines
+        )
+    then
+        return nil
+    end
+    return draft
+end
+
 ---@param data ParleyConversation
 ---@return ParleyInline.Preview? preview Nil uses the initial local-note card.
 function M.preview(data)
+    local draft = visible_draft(data)
+    if data.response and not draft then
+        return data.response
+    end
     if data.resolved then
         local latest = data.thread.messages[#data.thread.messages]
         return {
@@ -173,12 +198,12 @@ function M.preview(data)
     if #data.thread.messages == 0 then
         return
     end
-    if data.pending then
+    if draft then
         return {
-            buffer = data.pending.buffer,
+            buffer = draft.buffer,
             role = "human",
             state = ("draft · %d entries"):format(#data.thread.messages + 1),
-            created_at = data.pending.created_at,
+            created_at = draft.created_at,
         }
     end
     local latest = data.thread.messages[#data.thread.messages]
@@ -241,15 +266,32 @@ function M.refresh(source, items, selected)
     end
     local cards = {}
     for _, item in ipairs(source.items) do
-        cards[#cards + 1] = {
-            note = item.conversation.note,
-            preview = M.preview(item.conversation),
-            first = item.first,
-            last = item.last,
-        }
+        if not item.conversation.deleted then
+            cards[#cards + 1] = {
+                note = item.conversation.note,
+                preview = M.preview(item.conversation),
+                first = item.first,
+                last = item.last,
+            }
+        end
     end
     local selection = source.state.selected
     inline.update(source.view, source.buffer, cards, selection and selection.note.id)
+end
+
+---Activity arrivals refresh an existing reader only. General source/layout
+---refresh must not feed reader geometry changes back into another layout pass.
+---@param source ParleyConversation.Source
+function M.update_reply(source)
+    local presentation = source.presentation
+    if
+        available(source)
+        and presentation
+        and presentation.reader
+        and not presentation.reader.composing
+    then
+        discussion.update(presentation.reader)
+    end
 end
 
 local function changed(source)
@@ -290,6 +332,55 @@ function M.close(source, restore)
     end
 end
 
+---Return only the currently focused thread, never a remembered selection from
+---another window or a source range that no longer contains the cursor.
+---@return ParleyConversation?
+function M.active()
+    local window, buffer = api.nvim_get_current_win(), api.nvim_get_current_buf()
+    local function reading(display)
+        return display and display.window == window and display.buffer == buffer
+    end
+    local function composing(editor)
+        return editor and editor.window == window and editor.note.buffer == buffer
+    end
+    local presentation = current
+    if presentation and not presentation.data.deleted then
+        local reader = presentation.reader
+        if
+            composing(presentation.editor)
+            or reader
+                and not reader.closed
+                and (reading(reader) or reading(reader.parent) or composing(reader.editor))
+        then
+            return presentation.data
+        end
+    end
+    local source = sources[window]
+    if source and focused(source) then
+        local data = source.state.selected
+        local item = data and not data.deleted and find_item(source, data)
+        local line = api.nvim_win_get_cursor(window)[1]
+        if item and line >= item.first and line <= item.last then
+            return data
+        end
+    end
+end
+
+---Release only this deleted thread's views. All retained text and source
+---attachments belong to the host and remain available for inspection.
+---@param data ParleyConversation
+function M.hide(data)
+    for _, source in pairs(sources) do
+        if source.state.selected == data then
+            source.state.selected = nil
+        end
+        if source.presentation and source.presentation.data == data then
+            M.close(source, true)
+        end
+        M.refresh(source)
+    end
+end
+
 ---Enter the previewed entry, explicitly reply, resume retained reading state, or
 ---only reveal the source card (nil). This is the same action for every caller.
 ---@param source ParleyConversation.Source
@@ -298,7 +389,7 @@ end
 ---@param label? string Original identity for an explicitly unplaced local note.
 ---@return boolean opened
 function M.show(source, data, entry, label)
-    if not focused(source) then
+    if data.deleted or not focused(source) then
         return false
     end
     if current then
@@ -363,6 +454,7 @@ function M.show(source, data, entry, label)
                 first = item and item.first,
                 last = item and item.last,
                 keymaps = source.keys.composer,
+                thread_action = source.options.thread_action,
                 enter = entry ~= nil,
                 room = room,
                 navigate = function(step)
@@ -381,10 +473,11 @@ function M.show(source, data, entry, label)
             end
         else
             local latest = data.thread.messages[#data.thread.messages]
+            local draft = visible_draft(data)
             local message_id = entry ~= "resume"
-                    and (data.pending and data.pending.entry_id or latest.id)
+                    and (draft and draft.entry_id or (data.response and data.response.id) or latest.id)
                 or nil
-            local continue_draft = entry == "reply" or (entry == "read" and data.pending ~= nil)
+            local continue_draft = entry == "reply" or (entry == "read" and draft ~= nil)
             local reader = discussion.open(data.thread, {
                 source_win = source.window,
                 source_label = source_label,
@@ -396,14 +489,18 @@ function M.show(source, data, entry, label)
                 enter = not continue_draft,
                 keymaps = source.keys.discussion,
                 composer_keymaps = source.keys.composer,
+                thread_action = source.options.thread_action,
                 reply = function(parent_id)
                     return reply_draft(data, parent_id)
                 end,
                 edit = function(id)
                     return revision_draft(data, id)
                 end,
-                draft = function()
-                    return data.pending
+                draft = function(editing)
+                    return editing and data.pending or visible_draft(data)
+                end,
+                response = function()
+                    return data.response
                 end,
                 changed = function()
                     changed(source)
@@ -465,7 +562,7 @@ function M.comment(source, range)
     end
     for index = #source.items, 1, -1 do
         local item = source.items[index]
-        if item.first == first and item.last == last then
+        if not item.conversation.deleted and item.first == first and item.last == last then
             M.show(source, item.conversation, "read")
             return item.conversation
         end
@@ -485,12 +582,17 @@ function M.edit(source, create, entry)
     end
     local line = api.nvim_win_get_cursor(source.window)[1]
     local selected = source.state.selected and find_item(source, source.state.selected)
-    if selected and line >= selected.first and line <= selected.last then
+    if
+        selected
+        and not selected.conversation.deleted
+        and line >= selected.first
+        and line <= selected.last
+    then
         return M.show(source, selected.conversation, entry or "read")
     end
     for index = #source.items, 1, -1 do
         local item = source.items[index]
-        if line >= item.first and line <= item.last then
+        if not item.conversation.deleted and line >= item.first and line <= item.last then
             return M.show(source, item.conversation, entry or "read")
         end
     end
@@ -511,7 +613,12 @@ function M.move(source, step)
         source.options.navigate(step)
         return
     end
-    local items = vim.list_extend({}, source.items)
+    local items = {}
+    for _, item in ipairs(source.items) do
+        if not item.conversation.deleted then
+            items[#items + 1] = item
+        end
+    end
     table.sort(items, function(left, right)
         if left.first ~= right.first then
             return left.first < right.first
@@ -548,6 +655,9 @@ end
 ---@return ParleyConversation.Capture? capture
 ---@return string? failure
 function M.capture(data, author, origin)
+    if data.deleted or data.resolved then
+        return
+    end
     local draft = data.pending or data.note
     if not api.nvim_buf_is_loaded(draft.buffer) then
         return nil, "retained draft buffer is unavailable; it was not recreated"
@@ -639,6 +749,10 @@ function M.accept(batch)
             return nil, "submission capture is unknown, changed or already accepted"
         end
         local data, snapshot = saved.data, saved.snapshot
+        if data.deleted then
+            return nil,
+                "conversation was deleted after capture; evidence retained without application"
+        end
         if seen[snapshot.conversation_id] then
             return nil, "submission captures more than one draft for a conversation"
         end
@@ -699,6 +813,9 @@ end
 ---@return true? success
 ---@return string? failure
 function M.receive_batch(data, messages, expected_version, expected_tip_id)
+    if data.deleted then
+        return nil, "conversation is deleted; incoming evidence was not applied"
+    end
     if type(messages) ~= "table" or not vim.islist(messages) or #messages == 0 then
         return nil, "incoming messages must be a nonempty dense array"
     end
@@ -733,6 +850,9 @@ end
 ---@return true? success
 ---@return string? failure
 function M.receive(data, message)
+    if data.deleted then
+        return nil, "conversation is deleted; incoming evidence was not applied"
+    end
     if type(message) ~= "table" then
         return nil, "message must be a table"
     end
@@ -889,6 +1009,17 @@ function M.attach(options)
                     end,
                 },
             }
+            if options.thread_action then
+                for _, name in ipairs({ "resolve", "reopen", "delete" }) do
+                    actions[#actions + 1] = {
+                        name = name,
+                        mode = "n",
+                        run = function()
+                            options.thread_action(name)
+                        end,
+                    }
+                end
+            end
             api.nvim_buf_call(source.buffer, function()
                 for _, action in ipairs(actions) do
                     for _, configured_key in ipairs(source.keys.review[action.name]) do

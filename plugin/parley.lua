@@ -3,60 +3,104 @@ if vim.g.loaded_parley then
 end
 vim.g.loaded_parley = true
 
-vim.api.nvim_create_user_command("ReviewStart", function()
-    require("parley").start()
-end, { desc = "Pair with the Pi review offer and start local review; no capture or model work" })
-vim.api.nvim_create_user_command("ReviewStop", function()
-    require("parley").stop()
-end, { desc = "Detach workspace review; keep buffers and drafts" })
+local function invalid(usage)
+    vim.notify("Parley: expected :Parley " .. usage, vim.log.levels.ERROR)
+end
 
-vim.api.nvim_create_user_command("ReviewDone", function(options)
-    require("parley").done(options.args ~= "" and options.args or nil)
-end, {
-    nargs = "?",
-    desc = "Wrap up this review (or a retained review ID); preserve notes and drafts",
-})
-
-vim.api.nvim_create_user_command("ReviewAsk", function()
-    require("parley").ask()
-end, { desc = "Explicitly submit eligible human comments across all conversations" })
-vim.api.nvim_create_user_command("ReviewInvestigate", function(options)
-    require("parley").investigate(options.args)
-end, { nargs = "+", desc = "Explicitly request investigation with free-form instructions" })
-
-vim.api.nvim_create_user_command("ParleyStart", function()
-    require("parley").start_implementation()
-end, { desc = "Pair with the /parley implementation fork; no submission" })
-vim.api.nvim_create_user_command("ParleyTurn", function()
-    require("parley").turn()
-end, { desc = "Submit eligible prose across unresolved implementation conversations" })
-vim.api.nvim_create_user_command("ParleyDone", function()
-    require("parley").finish_implementation()
-end, { desc = "Finish implementation and return a recap to the originating Pi parent" })
-vim.api.nvim_create_user_command("ParleyStop", function()
-    require("parley").stop()
-end, { desc = "Detach presentation; does not finish or cancel implementation" })
-vim.api.nvim_create_user_command("ParleyResolve", function()
-    require("parley").resolve_note(true)
-end, { desc = "Exclude the selected conversation from turns; preserve history and drafts" })
-vim.api.nvim_create_user_command("ParleyReopen", function()
-    require("parley").resolve_note(false)
-end, { desc = "Include the selected conversation in future turns; no submission" })
-
-vim.api.nvim_create_user_command("ParleyDemo", function(options)
-    if options.args == "append" then
-        require("parley.demo").append()
-    elseif options.args == "reload" then
-        require("parley.demo").reload()
-    elseif options.args == "" then
-        require("parley.demo").open()
+vim.api.nvim_create_user_command("Parley", function(options)
+    local args = options.fargs
+    local action = args[1]
+    local parley = require("parley")
+    if action == "start" then
+        if #args > 2 or (args[2] and args[2] ~= "review" and args[2] ~= "implementation") then
+            return invalid("start [review|implementation]")
+        end
+        if args[2] == "review" then
+            parley.start()
+        else
+            parley.start_implementation()
+        end
+    elseif action == "stop" then
+        if #args ~= 1 then
+            return invalid("stop")
+        end
+        parley.stop()
+    elseif action == "submit" then
+        if #args ~= 1 then
+            return invalid("submit")
+        end
+        if require("parley.workspace").workflow() == "parley" then
+            parley.turn()
+        else
+            parley.ask()
+        end
+    elseif action == "investigate" then
+        local instructions = options.args:match("^%s*investigate%s+(.+)$")
+        if not instructions or not instructions:find("%S") then
+            return invalid("investigate <instructions>")
+        end
+        parley.investigate(instructions)
+    elseif action == "done" then
+        if #args > 2 then
+            return invalid("done [review-id]")
+        end
+        if require("parley.workspace").workflow() == "parley" then
+            if args[2] then
+                return invalid("done (implementation does not accept a review ID)")
+            end
+            parley.finish_implementation()
+        else
+            parley.done(args[2])
+        end
+    elseif action == "thread" then
+        if #args ~= 2 or not vim.tbl_contains({ "resolve", "reopen", "delete" }, args[2]) then
+            return invalid("thread resolve|reopen|delete")
+        end
+        if args[2] == "delete" then
+            parley.delete_note()
+        else
+            parley.resolve_note(args[2] == "resolve")
+        end
+    elseif action == "demo" then
+        if #args > 2 or (args[2] and args[2] ~= "append" and args[2] ~= "reload") then
+            return invalid("demo [append|reload]")
+        end
+        local demo = require("parley.demo")
+        if args[2] == "append" then
+            demo.append()
+        elseif args[2] == "reload" then
+            demo.reload()
+        else
+            demo.open()
+        end
     else
-        vim.notify("Parley: expected :ParleyDemo [append|reload]", vim.log.levels.ERROR)
+        invalid("start|stop|submit|investigate|done|thread|demo")
     end
 end, {
-    nargs = "?",
-    complete = function()
-        return { "append", "reload" }
+    nargs = "*",
+    complete = function(lead, line, cursor)
+        -- Only consider text before the cursor, including an unfinished argument.
+        local prefix = line:sub(1, cursor)
+        local args = vim.split(prefix, "%s+", { trimempty = true })
+        if prefix:match("%s$") then
+            args[#args + 1] = ""
+        end
+        local candidates = {}
+        if #args == 2 then
+            candidates = { "start", "stop", "submit", "investigate", "done", "thread", "demo" }
+        elseif #args == 3 then
+            if args[2] == "start" then
+                candidates = { "review", "implementation" }
+            elseif args[2] == "thread" then
+                candidates = { "resolve", "reopen", "delete" }
+            elseif args[2] == "demo" then
+                candidates = { "append", "reload" }
+            end
+        end
+        return vim.tbl_filter(function(value)
+            return value:sub(1, #lead) == lead
+                and (value ~= "investigate" or require("parley.workspace").workflow() ~= "parley")
+        end, candidates)
     end,
-    desc = "Open, append sample history, or reload local demo UI; no agent execution",
+    desc = "Start, detach, submit, finish, manage threads, or open the local demo",
 })

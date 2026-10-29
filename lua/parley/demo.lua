@@ -20,8 +20,8 @@ local fixture
 
 local source = {
     "-- Parley demo: synthetic history and local drafts; no agent execution.",
-    "-- :ParleyDemo reload refreshes the UI; :q leaves drafts/history intact.",
-    "-- :ParleyDemo append adds sample history without selecting it. No files written.",
+    "-- :Parley demo reload refreshes the UI; :q leaves drafts/history intact.",
+    "-- :Parley demo append adds sample history without selecting it. No files written.",
     "",
     "local M = {}",
     "",

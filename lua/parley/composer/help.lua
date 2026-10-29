@@ -122,6 +122,9 @@ function M.row(buffer, bindings, mode, width)
         },
         { key = action_key("close"), label = "close" },
         { key = navigation_key, label = navigation_label },
+        { key = action_key("resolve"), label = "resolve" },
+        { key = action_key("reopen"), label = "reopen" },
+        { key = action_key("delete"), label = "delete" },
         { key = action_key("help") or action_key("help_normal"), label = "help" },
     }
     local row, used = {}, 0

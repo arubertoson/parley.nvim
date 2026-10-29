@@ -35,7 +35,12 @@ export function installParley(pi: ExtensionAPI, review: {
   busy(): boolean;
   release(): Promise<void>;
   captureCommit(root: string, signal?: AbortSignal): Promise<string>;
-}): { active(): boolean; close(): Promise<void> } {
+}): {
+  active(): boolean;
+  close(): Promise<void>;
+  start(args: string, ctx: ExtensionCommandContext): Promise<void>;
+  stop(args: string, ctx: ExtensionCommandContext): Promise<void>;
+} {
   let interaction: Interaction | undefined;
   let retained: Interaction | undefined;
 
@@ -94,7 +99,7 @@ export function installParley(pi: ExtensionAPI, review: {
   });
   pi.on("input", (event, ctx) => {
     if (interaction && event.source !== "extension") {
-      ctx.ui.notify("Parley is active. Use :ParleyTurn / :ParleyDone in Neovim, or /parley-stop here. Input was not queued.", "warning");
+      ctx.ui.notify("Parley is active. Use :Parley submit / :Parley done in Neovim, or /parley stop here. Input was not queued.", "warning");
       return { action: "handled" };
     }
   });
@@ -107,36 +112,33 @@ export function installParley(pi: ExtensionAPI, review: {
     }
   });
 
-  pi.registerCommand("parley", {
-    description: "Fork working context for editor-driven implementation; finish in Neovim to return a recap",
-    handler: async (args, ctx) => {
-      if (args.trim() || ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || interaction || review.busy()) {
-        ctx.ui.notify("Use /parley without arguments from an idle parent, after completing any open review. Nothing queued.", "error");
-        return;
-      }
-      const transcriptPath = ctx.sessionManager.getSessionFile();
-      if (!transcriptPath || !ctx.model) {
-        ctx.ui.notify("Parley requires a persistent parent transcript and explicit model.", "error");
-        return;
-      }
-      const owner: Interaction = { id: randomUUID(), sessionId: ctx.sessionManager.getSessionId(), transcriptPath,
-        startEntryId: ctx.sessionManager.getLeafId(), ctx, launchAllowed: false };
-      interaction = owner;
-      try {
-        if (retained) { await cleanup(retained); retained = undefined; }
-        await review.release();
-        const { ParleyFork } = await import("./parley-interaction.ts");
-        if (!current(owner)) throw new Error("Parent changed during fork setup");
-        owner.fork = ParleyFork.capture(ctx, pi.getThinkingLevel());
-        owner.launchAllowed = true;
-        pi.sendMessage({ customType: "parley-enter", display: false, details: { interactionId: owner.id },
-          content: `The user invoked /parley. Call parley_interact with interactionId ${owner.id} as your only tool call. Do not implement, plan or run other tools in this parent. That tool hosts an independent context-preserving implementation fork, accepts editor instructions, and returns the recap when the user finishes. After it returns, use the recap to continue the parent conversation.` }, { triggerTurn: true });
-      } catch (error) {
-        if (interaction === owner) interaction = undefined;
-        ctx.ui.notify(`Parley startup failed: ${String(error)}. Any fork evidence is retained; nothing replayed.`, "error");
-      }
-    },
-  });
+  async function start(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (args.trim() || ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || interaction || review.busy()) {
+      ctx.ui.notify("Use /parley without arguments from an idle parent, after completing any open review. Nothing queued.", "error");
+      return;
+    }
+    const transcriptPath = ctx.sessionManager.getSessionFile();
+    if (!transcriptPath || !ctx.model) {
+      ctx.ui.notify("Parley requires a persistent parent transcript and explicit model.", "error");
+      return;
+    }
+    const owner: Interaction = { id: randomUUID(), sessionId: ctx.sessionManager.getSessionId(), transcriptPath,
+      startEntryId: ctx.sessionManager.getLeafId(), ctx, launchAllowed: false };
+    interaction = owner;
+    try {
+      if (retained) { await cleanup(retained); retained = undefined; }
+      await review.release();
+      const { ParleyFork } = await import("./parley-interaction.ts");
+      if (!current(owner)) throw new Error("Parent changed during fork setup");
+      owner.fork = ParleyFork.capture(ctx, pi.getThinkingLevel());
+      owner.launchAllowed = true;
+      pi.sendMessage({ customType: "parley-enter", display: false, details: { interactionId: owner.id },
+        content: `The user invoked /parley. Call parley_interact with interactionId ${owner.id} as your only tool call. Do not implement, plan or run other tools in this parent. That tool hosts an independent context-preserving implementation fork, accepts editor instructions, and returns the recap when the user finishes. After it returns, use the recap to continue the parent conversation.` }, { triggerTurn: true });
+    } catch (error) {
+      if (interaction === owner) interaction = undefined;
+      ctx.ui.notify(`Parley startup failed: ${String(error)}. Any fork evidence is retained; nothing replayed.`, "error");
+    }
+  }
 
   pi.registerTool({
     name: "parley_interact", label: "Parley editor interaction", exposure: "model-only",
@@ -192,8 +194,8 @@ export function installParley(pi: ExtensionAPI, review: {
         await owner.startup;
         if (!current(owner) || signal?.aborted) throw new Error("Implementation owner changed while publishing offer");
         owner.ready = true;
-        ctx.ui.setStatus("parley-implementation", "Parley · :ParleyStart in Neovim");
-        ctx.ui.notify("Implementation fork ready. Use :ParleyStart, :ParleyTurn, then :ParleyDone in Neovim. Save source buffers before each turn.", "info");
+        ctx.ui.setStatus("parley-implementation", "Parley · :Parley start in Neovim");
+        ctx.ui.notify("Implementation fork ready. Use :Parley start, :Parley submit, then :Parley done in Neovim. Save source buffers before each turn.", "info");
         update?.({ content: [{ type: "text", text: "Editor interaction active; parent execution paused." }], details: { transcriptPath: fork.manager.getSessionFile() } });
         const summary = await completed;
         if (!current(owner)) throw new Error("Originating parent changed; recap retained without rerouting");
@@ -219,7 +221,7 @@ export function installParley(pi: ExtensionAPI, review: {
 
   async function stop(args: string, ctx: ExtensionCommandContext): Promise<void> {
     if (args.trim() || ctx.mode !== "tui") {
-      ctx.ui.notify("Use /parley-stop without arguments in the originating Pi session. Nothing queued or cancelled.", "error");
+      ctx.ui.notify("Use /parley stop without arguments in the originating Pi session. Nothing queued or cancelled.", "error");
       return;
     }
     const owner = interaction;
@@ -227,7 +229,7 @@ export function installParley(pi: ExtensionAPI, review: {
     const originating = (): boolean => interaction === owner
       && ctx.sessionManager.getSessionId() === owner.sessionId && ctx.sessionManager.getSessionFile() === owner.transcriptPath;
     if (!originating() || !current(owner) || owner.stopping || !owner.ready || !owner.owner?.reviewId) {
-      ctx.ui.notify("ParleyStop requires the originating Pi session and a ready interaction, not initialization or an ongoing stop. Nothing queued or cancelled.", "error");
+      ctx.ui.notify("/parley stop requires the originating Pi session and a ready interaction, not initialization or an ongoing stop. Nothing queued or cancelled.", "error");
       return;
     }
     let closing: Promise<void>;
@@ -265,10 +267,5 @@ export function installParley(pi: ExtensionAPI, review: {
     }
   }
 
-  pi.registerCommand("parley-stop", {
-    description: "Stop the current implementation interaction without wrap-up; preserve edits, drafts and transcript",
-    handler: stop,
-  });
-
-  return { active: () => !!interaction, close };
+  return { active: () => !!interaction, close, start, stop };
 }

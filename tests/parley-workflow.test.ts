@@ -177,6 +177,9 @@ test("/parley runs normal child turns, publishes exact-tip replies, returns reca
   const implementation = snapshot.sessions.find(item => item.record.role === "implementation");
   assert(implementation?.end);
   const childText = await fs.readFile(implementation.record.transcriptPath, "utf8");
+  assert.match(childText, /editor message boxes show plain text; Markdown is not rendered/);
+  assert.match(childText, /Keep editor replies concise: a few short sentences/);
+  assert.match(childText, /no Markdown headings, emphasis, list markup, tables, formatted links or code fences/);
   assert(childText.includes('"toolName":"codemode"'));
   assert(childText.includes('"toolName":"parley_reply"'));
   const parentText = await fs.readFile(parentPath, "utf8");
@@ -190,7 +193,7 @@ test("/parley runs normal child turns, publishes exact-tip replies, returns reca
   const cancelled = await attach();
   await cancelled.turn("cancelled", "Wait for cancellation", false);
   await until(async () => { try { return await fs.readFile(path.join(root, "waiting"), "utf8"); } catch { return undefined; } });
-  await command("prompt", { message: "/parley-stop" });
+  await command("prompt", { message: "/parley stop" });
   await until(async () => settled === 2 ? true : undefined);
   const cancelledSnapshot = await cancelled.artifact();
   assert.equal(cancelledSnapshot.requests[0].outcome?.status, "cancelled");

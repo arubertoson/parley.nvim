@@ -35,6 +35,10 @@ function M.resolve_note(resolved)
     workspace.resolve_note(resolved)
 end
 
+function M.delete_note()
+    workspace.delete_note()
+end
+
 function M.stop()
     require("parley.bridge").stop()
 end
@@ -57,6 +61,16 @@ end
 ---@return ParleyInteraction.Status
 function M.request_status()
     return require("parley.interaction").status()
+end
+
+---Explicit read-only view of the latest acknowledged review request; no retrieval/model work.
+function M.request_report()
+    local report = require("parley.interaction").request_report()
+    if not report then
+        vim.notify("Parley: no acknowledged request report is cached", vim.log.levels.INFO)
+        return
+    end
+    return require("parley.report").show(report)
 end
 
 ---@param scope? 'line'|'range'

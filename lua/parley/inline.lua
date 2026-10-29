@@ -87,7 +87,9 @@ local function card(view, item, budget)
     local preview = item.preview or item.note
     local text, state, role
     if item.preview then
-        budget = math.min(8, budget)
+        if not selected then
+            budget = math.min(8, budget)
+        end
         state, role, text = item.preview.state, item.preview.role, item.preview.lines
     end
     -- Presentation reload cannot upgrade a cached host. Refuse its old
@@ -123,6 +125,7 @@ local function card(view, item, budget)
         style.card_line(indent, width, padding, {
             { heading, "ParleyReviewNoteHeading" },
         }, selected, role),
+        style.card_line(indent, width, padding, {}, selected, role),
     }
 
     local body = selected and "ParleyReviewNoteActive" or "ParleyReviewNote"

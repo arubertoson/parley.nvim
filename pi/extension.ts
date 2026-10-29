@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { WorkspaceBridge, workspaceRoot } from "./bridge.ts";
 import { ReviewRequests } from "./requests.ts";
+import type { ReviewCompletion } from "./requests.ts";
 import { installParley } from "./parley.ts";
 import type { DiscoveryTool } from "./interaction.ts";
 
@@ -92,8 +93,8 @@ async function closeParentReviews(owners: readonly ReviewRequests[], parent: Ext
   await closeReviews(owners, endEntryId);
 }
 
-// Only /review initializes a context-free review and publishes an offer.
-// Neovim's ReviewStart owns pairing/activation; parent-context handoff is optional.
+// Only /parley review initializes a context-free review and publishes an offer.
+// Neovim's :Parley start review owns pairing/activation; parent-context handoff is optional.
 export default function parley(pi: ExtensionAPI): void {
   let bridge: WorkspaceBridge | undefined;
   let context: ExtensionContext | undefined;
@@ -105,8 +106,9 @@ export default function parley(pi: ExtensionAPI): void {
   let preparing = false;
   let reviewStopping: Promise<void> | undefined;
   // Ended owners retain summaries and late correlated delivery receipts until
-  // this parent session ends. /review (or an explicit handoff) can start a fresh review.
+  // this parent session ends. /parley review (or an explicit handoff) can start a fresh review.
   const reviewsById = new Map<string, ReviewRequests>();
+  const publishedSummaries = new Set<string>();
   const implementation = installParley(pi, {
     busy: () => !!offerStartup || preparing || !!reviewStopping || !!activeReview && !activeReview.ended,
     release: async () => {
@@ -116,6 +118,22 @@ export default function parley(pi: ExtensionAPI): void {
     },
     captureCommit: (root, signal) => captureStartingCommit(pi, root, signal),
   });
+
+  function publishReviewSummary(result: ReviewCompletion, reopen = false): void {
+    if (result.state !== "completed" || result.summary === null) {
+      throw new Error(result.error || "Wrap-up did not complete; inspect retained evidence");
+    }
+    if (publishedSummaries.has(result.reviewId) && !reopen) return;
+    // Claim before sending: an uncertain display failure is not permission for
+    // another automatic delivery. Explicit Pi Done can reopen the saved recap.
+    publishedSummaries.add(result.reviewId);
+    pi.sendMessage({
+      customType: "parley-review-done",
+      content: result.summary,
+      display: true,
+      details: { reviewId: result.reviewId, artifactPath: result.artifactPath },
+    }, { triggerTurn: false });
+  }
 
   function createRequests(root: string, sessionId: string): ReviewRequests {
     return new ReviewRequests(root, sessionId, discoveryTools(), error => {
@@ -162,6 +180,7 @@ export default function parley(pi: ExtensionAPI): void {
       previousReviews.add(activeReview);
     }
     reviewsById.clear();
+    publishedSummaries.clear();
     const previousParent = parentContext;
     const previousStopping = reviewStopping;
     activeReview = undefined;
@@ -223,7 +242,7 @@ export default function parley(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "parley_prepare",
     label: "Prepare review handoff",
-    description: "Only on an explicit request to prepare a Parley review handoff: optionally enrich the context-free /review with a bounded objective, scope, settled decisions, guidelines and curated context with source provenance. Do not clone session history. Requires an existing /review offer. No review model work starts.",
+    description: "Only on an explicit request to prepare a Parley review handoff: optionally enrich the context-free /parley review with a bounded objective, scope, settled decisions, guidelines and curated context with source provenance. Do not clone session history. Requires an existing /parley review offer. No review model work starts.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -244,7 +263,7 @@ export default function parley(pi: ExtensionAPI): void {
       const current = (): boolean => generation === token && activeReview === owner && bridge === offer
         && !bridgeFailed && ctx.sessionManager.getSessionId() === sessionId && !signal?.aborted;
       if (!owner || !offer || owner.sessionId !== sessionId || preparing || offerStartup || reviewStopping || !current()) {
-        throw new Error("Use /review in this parent session first; preparation is unavailable or busy. Nothing queued.");
+        throw new Error("Use /parley review in this parent session first; preparation is unavailable or busy. Nothing queued.");
       }
       const transcriptPath = ctx.sessionManager.getSessionFile();
       if (!transcriptPath || !ctx.model) {
@@ -269,7 +288,7 @@ export default function parley(pi: ExtensionAPI): void {
         }
         reviewsById.set(preparation.reviewId, owner);
         return {
-          content: [{ type: "text", text: `Review handoff persisted (${preparation.id}). Artifact: ${JSON.stringify(owner.artifactPath)}. Use :ReviewAsk or :ReviewInvestigate in the paired editor. The isolated review session starts lazily on an accepted request.` }],
+          content: [{ type: "text", text: `Review handoff persisted (${preparation.id}). Artifact: ${JSON.stringify(owner.artifactPath)}. Use :Parley submit or :Parley investigate in the paired editor. The isolated review session starts lazily on an accepted request.` }],
           details: { reviewId: preparation.reviewId, preparationId: preparation.id, artifactPath: owner.artifactPath },
         };
       } finally {
@@ -335,288 +354,320 @@ export default function parley(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("review-done", {
-    description: "Wrap up the current review (or /review-done <review-id>); retain evidence and grant no implementation authority",
-    handler: async (args, ctx) => {
-      const reviewId = args.trim() || activeReview?.reviewId;
-      const owner = reviewId ? reviewsById.get(reviewId) : undefined;
-      const token = generation;
-      const sessionId = ctx.sessionManager.getSessionId();
-      const transcriptPath = ctx.sessionManager.getSessionFile();
-      const current = (): boolean => generation === token && !!reviewId && reviewsById.get(reviewId) === owner
-        && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
-      if (ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || preparing || offerStartup || reviewStopping || !owner || !reviewId || !transcriptPath) {
-        ctx.ui.notify("ReviewDone requires the idle originating Pi session and an initialized review. Use /review first. Nothing queued.", "error");
-        return;
-      }
-      let durablyCompleted = false;
-      try {
-        owner.beginParentFinish(reviewId, randomUUID(), { sessionId, transcriptPath }, current);
-        ctx.ui.notify("Parley: wrapping up…", "info");
-        ctx.ui.setStatus("parley-wrap-up", "Parley · wrapping up…");
-        const result = await owner.waitForFinish(reviewId);
-        if (!current()) {
-          return; // Durable evidence is retained; never route elsewhere.
-        }
-        if (result.state !== "completed" || result.summary === null) {
-          throw new Error(result.error || "Wrap-up did not complete; inspect retained evidence");
-        }
-        durablyCompleted = true;
-        // Explicit parent invocation only. Editor-initiated Done never injects a
-        // parent message, starts a parent model turn, or changes its tools.
-        pi.sendMessage({
-          customType: "parley-review-done",
-          content: result.summary,
-          display: true,
-          details: { reviewId, artifactPath: result.artifactPath },
-        }, { triggerTurn: false });
-        ctx.ui.notify("Parley: review completed. Use /review, then :ReviewStart for a new review.", "info");
-        if (result.cleanupError) {
-          ctx.ui.notify(`Review completed, but cleanup failed: ${result.cleanupError}`, "warning");
-        }
-      } catch (error) {
-        if (current()) {
-          const recovery = durablyCompleted
-            ? "Review completed, but summary display failed. Run /review-done again to view the saved summary. "
-            : "";
-          const message = error instanceof Error ? error.message : String(error);
-          ctx.ui.notify(`Parley: ${recovery}${message}`, "error");
-        }
-      } finally {
-        if (current()) {
-          try {
-            ctx.ui.setStatus("parley-wrap-up", undefined);
-          } catch (error) {
-            console.error("Parley wrap-up status cleanup failed", error);
-            ctx.ui.notify(`Parley: ${durablyCompleted ? "Review completed, but" : "Wrap-up operation retained;"} status cleanup failed. Inspect the saved operation, without replay.`, "warning");
-          }
-        }
-      }
+  pi.registerCommand("parley", {
+    description: "Start implementation (no arguments), offer a review, stop active work, or finish a review",
+    getArgumentCompletions: prefix => {
+      const commands = [
+        { value: "review", label: "review", description: "Offer a read-only review; pair with :Parley start review" },
+        { value: "stop", label: "stop", description: "Cancel active work; retain edits and evidence (optional exact review ID)" },
+        { value: "done", label: "done", description: "Finish a review (optional review ID); finish implementation in Neovim" },
+      ];
+      const matches = commands.filter(command => command.value.startsWith(prefix));
+      return matches.length ? matches : null;
     },
-  });
-
-  pi.registerCommand("review-stop", {
-    description: "Withdraw the current review (or /review-stop <review-id>); cancel running review work without wrap-up or rollback",
     handler: async (args, ctx) => {
-      const requestedId = args.trim();
-      if (ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || implementation.active()
-        || preparing || offerStartup || reviewStopping || requestedId && !isIdentifier(requestedId)) {
-        ctx.ui.notify("Use /review-stop [review-id] from the idle originating Pi session, after preparation/initialization settles. Nothing queued or cancelled.", "error");
-        return;
+      const trimmed = args.trim();
+      if (!trimmed) return implementation.start("", ctx);
+      const [action, ...rest] = trimmed.split(/\s+/);
+      const argument = rest.join(" ");
+      if (action === "review" && !argument) return startReview("", ctx);
+      if (action === "stop" && rest.length <= 1) {
+        return implementation.active() ? implementation.stop(argument, ctx) : stopReview(argument, ctx);
       }
-      const owner = activeReview;
-      const reviewId = owner?.reviewId;
-      const transcriptPath = ctx.sessionManager.getSessionFile();
-      if (!owner || !reviewId || !transcriptPath || requestedId && requestedId !== reviewId) {
-        ctx.ui.notify(requestedId ? "No matching active review; nothing stopped." : "No active review to stop.", requestedId ? "error" : "info");
-        return;
-      }
-      const offer = bridge;
-      const sessionId = ctx.sessionManager.getSessionId();
-      const sessionGeneration = generation;
-      const current = (): boolean => generation === sessionGeneration && activeReview === owner && bridge === offer
-        && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
-      let closing: Promise<void>;
-      try {
-        // Validation and authority withdrawal are synchronous. A rejected stop
-        // must not remove the offer or interrupt an accepted Done operation.
-        closing = owner.stopParent(reviewId, { sessionId, transcriptPath }, ctx.sessionManager.getLeafId(), current);
-      } catch (error) {
-        ctx.ui.notify(`Parley: ${error instanceof Error ? error.message : String(error)}`, "error");
-        return;
-      }
-      const token = ++generation;
-      const stillOrigin = (): boolean => generation === token && activeReview === owner && bridge === offer
-        && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
-      const operation = (async () => {
-        // Keep the workspace lease until execution has settled and the owner
-        // has attempted all cleanup. Then withdraw even if cleanup reported an
-        // error; never leave an advertised but unusable review behind.
-        const results = await Promise.allSettled([closing]);
-        results.push(...await Promise.allSettled([offer?.stop()]));
-        const failure = results.find(result => result.status === "rejected");
-        if (failure) throw failure.reason;
-      })();
-      reviewStopping = operation;
-      try {
-        await operation;
-        if (stillOrigin()) {
-          ctx.ui.notify("Review stopped without wrap-up. Evidence and editor drafts retained; no rollback. Use /review for a fresh review.", "info");
-        }
-      } catch (error) {
-        if (stillOrigin()) {
-          ctx.ui.notify(`Review withdrawn, but cleanup failed: ${String(error)}. Evidence retained; inspect it without replay.`, "error");
-        }
-      } finally {
-        try {
-          if (stillOrigin()) ctx.ui.setStatus("parley-bridge", undefined);
-        } catch (error) {
-          console.error("Parley withdrawal status cleanup failed", error);
-        }
-        if (activeReview === owner) {
-          activeReview = undefined;
-          parentContext = undefined;
-        }
-        if (reviewsById.get(reviewId) === owner) reviewsById.delete(reviewId);
-        if (bridge === offer) bridge = undefined;
-        if (reviewStopping === operation) reviewStopping = undefined;
-      }
-    },
-  });
-
-  pi.registerCommand("review", {
-    description: "Start a context-free review; use :ReviewStart in Neovim to pair and activate",
-    handler: async (args, ctx) => {
-      if (ctx.mode !== "tui") {
-        ctx.ui.notify("Parley requires the existing interactive Pi process", "error");
-        return;
-      }
-      if (args.trim()) {
-        ctx.ui.notify("Use /review without arguments, then :ReviewStart in Neovim.", "error");
-        return;
-      }
-      if (implementation.active() || offerStartup || preparing || reviewStopping || !ctx.isIdle() || ctx.hasPendingMessages()) {
-        ctx.ui.notify("Pi is busy; no review offer started.", "error");
-        return;
-      }
-      const sessionId = ctx.sessionManager.getSessionId();
-      const reusableOffer = bridge && !bridgeFailed && bridge.sessionId === sessionId ? bridge : undefined;
-      if (reusableOffer && activeReview?.initialized && !activeReview.ended) {
-        ctx.ui.notify("This review is already available; use :ReviewStart in Neovim.", "info");
-        return;
-      }
-      const sessionGeneration = generation;
-      const previous = bridge;
-      if (!reusableOffer) {
-        bridge = undefined;
-      }
-      // Commands can have distinct context objects. Session/generation own the
-      // offer, including failures reported while a fresh review initializes.
-      const current = (): boolean => generation === sessionGeneration
-        && ctx.sessionManager.getSessionId() === sessionId;
-      context = ctx;
-      const operation = (async () => {
-        if (!reusableOffer) {
-          await previous?.stop();
-        }
-        const root = await workspaceRoot(ctx.cwd);
-        if (!current()) {
+      if (action === "done" && rest.length <= 1) {
+        if (implementation.active()) {
+          ctx.ui.notify("Finish implementation in Neovim with :Parley done. Nothing queued.", "error");
           return;
         }
-        const offer = reusableOffer ?? new WorkspaceBridge(root, sessionId);
-        if (activeReview && (activeReview.root !== root || activeReview.sessionId !== sessionId)) {
-          throw new Error("Retained review belongs to another workspace/session; no silent rebinding");
-        }
-        const reviewOwner = activeReview && !activeReview.ended ? activeReview : createRequests(root, sessionId);
-        activeReview = reviewOwner;
-        parentContext = ctx;
-        offer.onReviewRequest = request => {
-          if (reviewStopping) {
-            throw new Error("ReviewStop is active. Nothing queued or accepted.");
-          }
-          if (preparing && request.action === "review-finish-begin") {
-            throw new Error("Preparation is active. Wait before ReviewDone; nothing queued or cancelled.");
-          }
-          let target: ReviewRequests | undefined;
-          if (request.reviewId === undefined) {
-            target = activeReview;
-          } else if (typeof request.reviewId === "string") {
-            target = reviewsById.get(request.reviewId);
-          }
-          if (!target || target.sessionId !== sessionId) {
-            throw new Error("No matching initialized review owner; no retargeting");
-          }
-          // A fresh review is not ready until its baseline is durable. Older
-          // exact owners still accept correlated receipts and saved-summary reads.
-          if (offerStartup && target === activeReview) {
-            throw new Error("Review initialization is active. Wait for /review to finish; nothing queued.");
-          }
-          return target.handle(request);
-        };
-        offer.onPeersChanged = () => {
-          if (bridge === offer && !bridgeFailed && current()) {
-            const attached = offer.editorChoices().length > 0;
-            ctx.ui.setStatus("parley-bridge", attached
-              ? "Parley review · editor paired"
-              : "Parley review available · :ReviewStart in Neovim");
-          }
-        };
-        offer.onFailure = error => {
-          if (bridge !== offer || !current()) {
-            return;
-          }
-          bridgeFailed = true;
-          ctx.ui.setStatus("parley-bridge", "Parley unavailable · /review");
-          ctx.ui.notify(`Parley bridge: ${error.message}`, "error");
-        };
-        try {
-          // Acquire the workspace lease before creating durable review evidence.
-          // Requests remain blocked by offerStartup until initialization settles.
-          if (!reusableOffer) {
-            await offer.start();
-          }
-          if (!current()) {
-            await offer.stop();
-            return;
-          }
-          if (reusableOffer && bridgeFailed) {
-            throw new Error("Review bridge failed during initialization; no readiness acknowledged");
-          }
-          bridge = offer;
-          bridgeFailed = false;
-          if (!reviewOwner.initialized) {
-            const transcriptPath = ctx.sessionManager.getSessionFile();
-            const model = ctx.model;
-            if (!transcriptPath || !model) {
-              throw new Error("Review requires a persistent parent transcript and an explicitly selected model; no fallback.");
-            }
-            const parent = {
-              sessionId,
-              transcriptPath,
-              startEntryId: ctx.sessionManager.getLeafId(),
-              model: { provider: model.provider, modelId: model.id, thinkingLevel: pi.getThinkingLevel() },
-            };
-            const startingCommit = await captureStartingCommit(pi, root);
-            await reviewOwner.prepare(contextFreeBrief, parent, startingCommit,
-              () => current() && activeReview === reviewOwner && bridge === offer && !bridgeFailed, model);
-          }
-          if (!current() || activeReview !== reviewOwner || bridge !== offer || bridgeFailed) {
-            throw new Error("Review owner changed during initialization; evidence retained without rebinding");
-          }
-          const reviewId = reviewOwner.reviewId;
-          if (!reviewId) {
-            throw new Error("Initialized review has no durable identity");
-          }
-          reviewsById.set(reviewId, reviewOwner);
-          offer.onPeersChanged();
-        } catch (error) {
-          if (bridge === offer) {
-            bridge = undefined;
-          }
-          try {
-            await offer.stop();
-          } catch (cleanupError) {
-            console.error("Parley offer cleanup failed", cleanupError);
-          }
-          throw error;
-        }
-      })();
-      offerStartup = operation;
-      try {
-        await operation;
-        if (current() && bridge) {
-          ctx.ui.notify("Review ready. Use :ReviewStart in Neovim. No reviewer work started or parent conversation content captured. Parent-context handoff is optional.", "info");
-        }
-      } catch (error) {
-        if (current()) {
-          ctx.ui.setStatus("parley-bridge", undefined);
-          ctx.ui.notify(`Parley: ${String(error)}. Review unavailable; any persisted evidence is retained, without replay.`, "error");
-        }
-      } finally {
-        if (offerStartup === operation) {
-          offerStartup = undefined;
-        }
+        return finishReview(argument, ctx);
       }
+      ctx.ui.notify("Use /parley, /parley review, /parley stop [review-id], or /parley done [review-id]. Nothing queued.", "error");
     },
   });
+
+  async function finishReview(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const reviewId = args.trim() || activeReview?.reviewId;
+    const owner = reviewId ? reviewsById.get(reviewId) : undefined;
+    const token = generation;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const transcriptPath = ctx.sessionManager.getSessionFile();
+    const current = (): boolean => generation === token && !!reviewId && reviewsById.get(reviewId) === owner
+      && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
+    if (ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || preparing || offerStartup || reviewStopping || !owner || !reviewId || !transcriptPath) {
+      ctx.ui.notify("/parley done requires the idle originating Pi session and an initialized review. Use /parley review first. Nothing queued.", "error");
+      return;
+    }
+    const reopen = owner.ended;
+    let durablyCompleted = false;
+    try {
+      owner.beginParentFinish(reviewId, randomUUID(), { sessionId, transcriptPath }, current);
+      ctx.ui.notify("Parley: wrapping up…", "info");
+      ctx.ui.setStatus("parley-wrap-up", "Parley · wrapping up…");
+      const result = await owner.waitForFinish(reviewId);
+      if (!current()) {
+        return; // Durable evidence is retained; never route elsewhere.
+      }
+      durablyCompleted = result.state === "completed";
+      publishReviewSummary(result, reopen);
+      ctx.ui.notify("Parley: review completed. Use /parley review, then :Parley start review for a new review.", "info");
+      if (result.cleanupError) {
+        ctx.ui.notify(`Review completed, but cleanup failed: ${result.cleanupError}`, "warning");
+      }
+    } catch (error) {
+      if (current()) {
+        const recovery = durablyCompleted
+          ? "Review completed, but summary display failed. Run /parley done again to view the saved summary. "
+          : "";
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Parley: ${recovery}${message}`, "error");
+      }
+    } finally {
+      if (current()) {
+        try {
+          ctx.ui.setStatus("parley-wrap-up", undefined);
+        } catch (error) {
+          console.error("Parley wrap-up status cleanup failed", error);
+          ctx.ui.notify(`Parley: ${durablyCompleted ? "Review completed, but" : "Wrap-up operation retained;"} status cleanup failed. Inspect the saved operation, without replay.`, "warning");
+        }
+      }
+    }
+  }
+
+  async function stopReview(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    const requestedId = args.trim();
+    if (ctx.mode !== "tui" || !ctx.isIdle() || ctx.hasPendingMessages() || implementation.active()
+      || preparing || offerStartup || reviewStopping || requestedId && !isIdentifier(requestedId)) {
+      ctx.ui.notify("Use /parley stop [review-id] from the idle originating Pi session, after preparation/initialization settles. Nothing queued or cancelled.", "error");
+      return;
+    }
+    const owner = activeReview;
+    const reviewId = owner?.reviewId;
+    const transcriptPath = ctx.sessionManager.getSessionFile();
+    if (!owner || !reviewId || !transcriptPath || requestedId && requestedId !== reviewId) {
+      ctx.ui.notify(requestedId ? "No matching active review; nothing stopped." : "No active review to stop.", requestedId ? "error" : "info");
+      return;
+    }
+    const offer = bridge;
+    const sessionId = ctx.sessionManager.getSessionId();
+    const sessionGeneration = generation;
+    const current = (): boolean => generation === sessionGeneration && activeReview === owner && bridge === offer
+      && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
+    let closing: Promise<void>;
+    try {
+      // Validation and authority withdrawal are synchronous. A rejected stop
+      // must not remove the offer or interrupt an accepted Done operation.
+      closing = owner.stopParent(reviewId, { sessionId, transcriptPath }, ctx.sessionManager.getLeafId(), current);
+    } catch (error) {
+      ctx.ui.notify(`Parley: ${error instanceof Error ? error.message : String(error)}`, "error");
+      return;
+    }
+    const token = ++generation;
+    const stillOrigin = (): boolean => generation === token && activeReview === owner && bridge === offer
+      && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
+    const operation = (async () => {
+      // Keep the workspace lease until execution has settled and the owner
+      // has attempted all cleanup. Then withdraw even if cleanup reported an
+      // error; never leave an advertised but unusable review behind.
+      const results = await Promise.allSettled([closing]);
+      results.push(...await Promise.allSettled([offer?.stop()]));
+      const failure = results.find(result => result.status === "rejected");
+      if (failure) throw failure.reason;
+    })();
+    reviewStopping = operation;
+    try {
+      await operation;
+      if (stillOrigin()) {
+        ctx.ui.notify("Review stopped without wrap-up. Evidence and editor drafts retained; no rollback. Use /parley review for a fresh review.", "info");
+      }
+    } catch (error) {
+      if (stillOrigin()) {
+        ctx.ui.notify(`Review withdrawn, but cleanup failed: ${String(error)}. Evidence retained; inspect it without replay.`, "error");
+      }
+    } finally {
+      try {
+        if (stillOrigin()) ctx.ui.setStatus("parley-bridge", undefined);
+      } catch (error) {
+        console.error("Parley withdrawal status cleanup failed", error);
+      }
+      if (activeReview === owner) {
+        activeReview = undefined;
+        parentContext = undefined;
+      }
+      if (reviewsById.get(reviewId) === owner) reviewsById.delete(reviewId);
+      if (bridge === offer) bridge = undefined;
+      if (reviewStopping === operation) reviewStopping = undefined;
+    }
+  }
+
+  async function startReview(args: string, ctx: ExtensionCommandContext): Promise<void> {
+    if (ctx.mode !== "tui") {
+      ctx.ui.notify("Parley requires the existing interactive Pi process", "error");
+      return;
+    }
+    if (args.trim()) {
+      ctx.ui.notify("Use /parley review without arguments, then :Parley start review in Neovim.", "error");
+      return;
+    }
+    if (implementation.active() || offerStartup || preparing || reviewStopping || !ctx.isIdle() || ctx.hasPendingMessages()) {
+      ctx.ui.notify("Pi is busy; no review offer started.", "error");
+      return;
+    }
+    const sessionId = ctx.sessionManager.getSessionId();
+    const reusableOffer = bridge && !bridgeFailed && bridge.sessionId === sessionId ? bridge : undefined;
+    if (reusableOffer && activeReview?.initialized && !activeReview.ended) {
+      ctx.ui.notify("This review is already available; use :Parley start review in Neovim.", "info");
+      return;
+    }
+    const sessionGeneration = generation;
+    const previous = bridge;
+    if (!reusableOffer) {
+      bridge = undefined;
+    }
+    // Commands can have distinct context objects. Session/generation own the
+    // offer, including failures reported while a fresh review initializes.
+    const current = (): boolean => generation === sessionGeneration
+      && ctx.sessionManager.getSessionId() === sessionId;
+    context = ctx;
+    const operation = (async () => {
+      if (!reusableOffer) {
+        await previous?.stop();
+      }
+      const root = await workspaceRoot(ctx.cwd);
+      if (!current()) {
+        return;
+      }
+      const offer = reusableOffer ?? new WorkspaceBridge(root, sessionId);
+      if (activeReview && (activeReview.root !== root || activeReview.sessionId !== sessionId)) {
+        throw new Error("Retained review belongs to another workspace/session; no silent rebinding");
+      }
+      const reviewOwner = activeReview && !activeReview.ended ? activeReview : createRequests(root, sessionId);
+      activeReview = reviewOwner;
+      parentContext = ctx;
+      offer.onReviewRequest = async request => {
+        if (reviewStopping) {
+          throw new Error("/parley stop is active. Nothing queued or accepted.");
+        }
+        if (preparing && request.action === "review-finish-begin") {
+          throw new Error("Preparation is active. Wait before :Parley done; nothing queued or cancelled.");
+        }
+        let target: ReviewRequests | undefined;
+        if (request.reviewId === undefined) {
+          target = activeReview;
+        } else if (typeof request.reviewId === "string") {
+          target = reviewsById.get(request.reviewId);
+        }
+        if (!target || target.sessionId !== sessionId) {
+          throw new Error("No matching initialized review owner; no retargeting");
+        }
+        // A fresh review is not ready until its baseline is durable. Older
+        // exact owners still accept correlated receipts and saved-summary reads.
+        if (offerStartup && target === activeReview) {
+          throw new Error("Review initialization is active. Wait for /parley review to finish; nothing queued.");
+        }
+        const token = generation;
+        const transcriptPath = target.parentTranscriptPath;
+        const result = await target.handle(request);
+        if (request.action === "review-finish-begin" && target.reviewId) {
+          const owner = target;
+          const reviewId = target.reviewId;
+          const stillOrigin = (): boolean => generation === token && reviewsById.get(reviewId) === owner
+            && ctx.sessionManager.getSessionId() === sessionId && ctx.sessionManager.getSessionFile() === transcriptPath;
+          // Accepted Done outlives editor disconnects. Deliver only to its
+          // original Pi session, independently of subsequent status polling.
+          owner.waitForFinish(reviewId).then(completion => {
+            if (stillOrigin()) publishReviewSummary(completion);
+          }).catch(error => {
+            console.error("Parley review wrap-up/recap delivery failed", error);
+            if (stillOrigin()) {
+              ctx.ui.notify(`Parley: ${String(error)}. Use /parley done ${reviewId} to inspect the saved wrap-up; no automatic replay.`, "error");
+            }
+          });
+        }
+        return result;
+      };
+      offer.onPeersChanged = () => {
+        if (bridge === offer && !bridgeFailed && current()) {
+          const attached = offer.editorChoices().length > 0;
+          ctx.ui.setStatus("parley-bridge", attached
+            ? "Parley review · editor paired"
+            : "Parley review available · :Parley start review in Neovim");
+        }
+      };
+      offer.onFailure = error => {
+        if (bridge !== offer || !current()) {
+          return;
+        }
+        bridgeFailed = true;
+        ctx.ui.setStatus("parley-bridge", "Parley unavailable · /parley review");
+        ctx.ui.notify(`Parley bridge: ${error.message}`, "error");
+      };
+      try {
+        // Acquire the workspace lease before creating durable review evidence.
+        // Requests remain blocked by offerStartup until initialization settles.
+        if (!reusableOffer) {
+          await offer.start();
+        }
+        if (!current()) {
+          await offer.stop();
+          return;
+        }
+        if (reusableOffer && bridgeFailed) {
+          throw new Error("Review bridge failed during initialization; no readiness acknowledged");
+        }
+        bridge = offer;
+        bridgeFailed = false;
+        if (!reviewOwner.initialized) {
+          const transcriptPath = ctx.sessionManager.getSessionFile();
+          const model = ctx.model;
+          if (!transcriptPath || !model) {
+            throw new Error("Review requires a persistent parent transcript and an explicitly selected model; no fallback.");
+          }
+          const parent = {
+            sessionId,
+            transcriptPath,
+            startEntryId: ctx.sessionManager.getLeafId(),
+            model: { provider: model.provider, modelId: model.id, thinkingLevel: pi.getThinkingLevel() },
+          };
+          const startingCommit = await captureStartingCommit(pi, root);
+          await reviewOwner.prepare(contextFreeBrief, parent, startingCommit,
+            () => current() && activeReview === reviewOwner && bridge === offer && !bridgeFailed, model);
+        }
+        if (!current() || activeReview !== reviewOwner || bridge !== offer || bridgeFailed) {
+          throw new Error("Review owner changed during initialization; evidence retained without rebinding");
+        }
+        const reviewId = reviewOwner.reviewId;
+        if (!reviewId) {
+          throw new Error("Initialized review has no durable identity");
+        }
+        reviewsById.set(reviewId, reviewOwner);
+        offer.onPeersChanged();
+      } catch (error) {
+        if (bridge === offer) {
+          bridge = undefined;
+        }
+        try {
+          await offer.stop();
+        } catch (cleanupError) {
+          console.error("Parley offer cleanup failed", cleanupError);
+        }
+        throw error;
+      }
+    })();
+    offerStartup = operation;
+    try {
+      await operation;
+      if (current() && bridge) {
+        ctx.ui.notify("Review ready. Use :Parley start review in Neovim. No reviewer work started or parent conversation content captured. Parent-context handoff is optional.", "info");
+      }
+    } catch (error) {
+      if (current()) {
+        ctx.ui.setStatus("parley-bridge", undefined);
+        ctx.ui.notify(`Parley: ${String(error)}. Review unavailable; any persisted evidence is retained, without replay.`, "error");
+      }
+    } finally {
+      if (offerStartup === operation) {
+        offerStartup = undefined;
+      }
+    }
+  }
 }

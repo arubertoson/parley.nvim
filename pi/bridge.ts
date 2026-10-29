@@ -521,7 +521,7 @@ export class WorkspaceBridge {
       throw new Error("Invalid editor label");
     }
     if (this.editor && this.editor.editorId !== editorId) {
-      throw new Error("Another Neovim owns this review; :ReviewStop there before pairing another editor");
+      throw new Error("Another Neovim owns this review; :Parley stop there before pairing another editor");
     }
     if (this.peers.size > 0) {
       throw new Error("The selected editor already has a live connection; no connection replaced");

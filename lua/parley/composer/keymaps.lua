@@ -14,6 +14,9 @@ local M = {}
 ---@field previous? ParleyKeymapKeys Normal/Insert: visit the previous note.
 ---@field help? ParleyKeymapKeys Normal-only: toggle contextual hotkey footer.
 ---@field help_normal? ParleyKeymapKeys Optional Normal-only help alias.
+---@field resolve? ParleyKeymapKeys Normal-only: resolve the active thread.
+---@field reopen? ParleyKeymapKeys Normal-only: reopen the active thread.
+---@field delete? ParleyKeymapKeys Normal-only: mark the active thread deleted after confirmation.
 
 local composer_defaults = {
     accept = "<CR>",
@@ -24,6 +27,9 @@ local composer_defaults = {
     previous = "<C-p>",
     help = "<leader>?",
     help_normal = false,
+    resolve = "<leader>tr",
+    reopen = "<leader>tR",
+    delete = "<leader>td",
 }
 
 ---An omitted action retains its defaults; false or an empty list disables it.

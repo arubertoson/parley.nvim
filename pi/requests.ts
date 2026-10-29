@@ -131,6 +131,11 @@ function serializeResult(snapshot: ReviewArtifactSnapshot, request: RequestRecor
     requestId: request.id,
     sessionId: session?.sessionId ?? null,
     outcome: { id: outcome.id, status: outcome.status, detail: outcome.detail, createdAt: outcome.createdAt },
+    ...(snapshot.header.type === "review" ? { report: {
+      publishedMessages: snapshot.records.filter(record => record.type === "message" && record.role === "agent" && record.requestId === request.id).length,
+      newFindings: snapshot.conversations.filter(history => history.record.requestId === request.id).length,
+      explanation: snapshot.requests.find(item => item.record.id === request.id)?.explanation?.text ?? null,
+    } } : {}),
   };
   let size = Buffer.byteLength(JSON.stringify({ ...envelope, conversations: [] }));
   const account = (bytes: number): void => {
@@ -205,6 +210,10 @@ export class ReviewRequests {
     return this.writer?.filename;
   }
 
+  get parentTranscriptPath(): string | undefined {
+    return this.writer?.snapshot().sessions.find(item => item.record.role === "parent")?.record.transcriptPath;
+  }
+
   // Both command and socket entry points call this exact operation. Returning
   // 'wrapping' acknowledges coordination, NOT durable review completion.
   beginFinish(reviewId: string, finishId: string, current: () => boolean): ReviewCompletion {
@@ -225,7 +234,7 @@ export class ReviewRequests {
     }
     this.expireTransfers();
     requireCondition(!this.operation && !this.upload && !writer.snapshot().activeRequestId && !this.interaction?.busy,
-      "Review work is active or settling. Wait or explicitly cancel it before ReviewDone; nothing queued");
+      "Review work is active or settling. Wait or explicitly cancel it before :Parley done; nothing queued");
     identifier(finishId);
     requireCondition(!this.finishIds.has(finishId) && !writer.snapshot().records.some(item => item.id === finishId),
       "Duplicate finish attempt; query its status, no replay");
@@ -250,7 +259,7 @@ export class ReviewRequests {
     current: () => boolean): ReviewCompletion {
     const origin = this.writer?.snapshot().sessions.find(item => item.record.role === "parent")?.record;
     requireCondition(origin?.sessionId === parent.sessionId && origin?.transcriptPath === parent.transcriptPath,
-      "ReviewDone requires the originating parent session/transcript; no cross-session completion");
+      ":Parley done requires the originating parent session/transcript; no cross-session completion");
     return this.beginFinish(reviewId, finishId, current);
   }
 
@@ -305,14 +314,14 @@ export class ReviewRequests {
       artifactPath: writer.filename, error: null, cleanupError };
   }
 
-  // /review persists a context-free baseline; explicit parent handoffs append
+  // /parley review persists a context-free baseline; explicit parent handoffs append
   // revisions. Pairing and health checks never initialize or enrich a review.
   async prepare(value: unknown, parent: ParentBoundary, startingCommit: string, current: () => boolean, model: ReviewModel): Promise<PreparationRecord> {
     if (this.creationFailure) throw this.creationFailure;
     this.expireTransfers();
     requireCondition(!this.closed && !this.operation && !this.upload && !this.writer?.snapshot().activeRequestId && !this.interaction?.busy,
       "Review is busy; preparation was not queued");
-    requireCondition(!this.ended, "Review is completed; use /review for a new owner, never reopen the old artifact");
+    requireCondition(!this.ended, "Review is completed; use /parley review for a new owner, never reopen the old artifact");
     requireCondition(current() && parent.sessionId === this.sessionId, "Parent session changed before preparation");
     const parentSession = this.writer?.snapshot().sessions.find(item => item.record.role === "parent")?.record;
     const selection = parentSession?.model;
@@ -448,7 +457,7 @@ export class ReviewRequests {
   }
 
   private beginUpload(request: ReviewPeerRequest, writer: ReviewArtifactWriter, preparation: PreparationRecord): Readonly<Record<string, unknown>> {
-    requireCondition(!writer.snapshot().end, "Review is completed; use /review in Pi, then :ReviewStart to select the new review");
+    requireCondition(!writer.snapshot().end, "Review is completed; use /parley review in Pi, then :Parley start review to select the new review");
     if (this.executionFailure) {
       throw this.executionFailure;
     }
@@ -491,7 +500,7 @@ export class ReviewRequests {
     const now = Math.floor(Date.now() / 1000);
     const request = parseArtifactRecord({ ...rawRequest, type: "request", reviewId, createdAt: now, preparationId: preparation.id });
     requireCondition(request.type === "request", "Expected accepting request record");
-    requireCondition(request.kind !== "wrap-up", "Wrap-up requires the explicit ReviewDone entry point, not a captured batch");
+    requireCondition(request.kind !== "wrap-up", "Wrap-up requires the explicit :Parley done entry point, not a captured batch");
     const conversations: ConversationRecord[] = [];
     const conversationIds = new Set<string>();
     for (const value of array(payload.conversations)) {
@@ -624,7 +633,7 @@ export class ReviewRequests {
     endEntryId: string | null, current: () => boolean): Promise<void> {
     const snapshot = this.writer?.snapshot();
     const origin = snapshot?.sessions.find(item => item.record.role === "parent")?.record;
-    const command = this.parley ? "ParleyStop" : "ReviewStop";
+    const command = "/parley stop";
     requireCondition(!this.closed && current() && snapshot?.header.id === reviewId
       && origin?.sessionId === parent.sessionId && origin?.transcriptPath === parent.transcriptPath,
       `${command} requires the exact originating parent and live review; nothing stopped`);

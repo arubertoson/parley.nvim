@@ -100,6 +100,16 @@ async function callTool(session: FakeSession, name: string, parameters: unknown)
   return value as Record<string, unknown>;
 }
 
+test("review turns request concise plain-text replies and findings for editor message boxes", async t => {
+  const { interaction, preparation, accept } = await fixture(t);
+  let instruction = "";
+  sdk.onPrompt = async (_session, prompt) => { instruction = prompt; };
+  await interaction.start(await accept("investigate"), preparation);
+  assert.match(instruction, /editor message boxes show plain text; Markdown is not rendered/);
+  assert.match(instruction, /Keep published replies and findings concise: a few short sentences/);
+  assert.match(instruction, /no Markdown headings, emphasis, list markup, tables, formatted links or code fences/);
+});
+
 test("discovery receipts publish immutable notes and exact-version replies, not editor application", async t => {
   const { root, writer, interaction, preparation, accept } = await fixture(t);
   await fs.writeFile(path.join(root, "source.ts"), "alpha\nbeta\ngamma\n");

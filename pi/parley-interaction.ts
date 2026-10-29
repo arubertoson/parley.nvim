@@ -192,7 +192,15 @@ export class ParleyInteraction {
         requireCondition(history && history.version === submission.version && history.messages.at(-1)?.id === submission.tipId, "Accepted implementation history changed");
         return history;
       });
-      const prompt = `Parley implementation turn. Work only on these explicitly submitted instructions, not the entire inherited plan. Use normal tools, obey guidelines and publish editor replies with parley_reply. Source captures may be unsaved: never overwrite unsaved editor content; conflicting source must be saved/reconciled by the user first. This is a shared workspace, not a checkout or worktree. Do not resolve conversations automatically.\n${JSON.stringify({ request: run.request, conversations })}`;
+      const prompt = "Parley implementation turn. Work only on these explicitly submitted instructions, not the entire inherited plan. "
+        + "Use normal tools, obey guidelines and publish editor replies with parley_reply. "
+        + "Source captures may be unsaved: never overwrite unsaved editor content; "
+        + "conflicting source must be saved/reconciled by the user first. "
+        + "This is a shared workspace, not a checkout or worktree. Do not resolve conversations automatically. "
+        + "Parley's editor message boxes show plain text; Markdown is not rendered. "
+        + "Keep editor replies concise: a few short sentences, no Markdown headings, emphasis, "
+        + "list markup, tables, formatted links or code fences. Use bare identifiers and file paths. "
+        + `\n${JSON.stringify({ request: run.request, conversations })}`;
       requireCondition(Buffer.byteLength(prompt) <= maxPromptBytes, "Implementation turn exceeds 4 MiB; no truncation");
       const session = await this.ensureSession(run, preparation);
       run.activity = "working";

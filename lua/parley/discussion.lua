@@ -17,6 +17,9 @@ local heading_namespace
 ---@field replaces_id? string Committed human message copied into this draft, never edited in place.
 ---@field accepted? ParleyThread.Message Last accepted capture from this buffer; later edits stay local.
 
+---@class ParleyDiscussion.Response: ParleyThread.Message
+---@field state string Request activity label; this entry is never persisted or a reply parent.
+
 ---@class ParleyDiscussion.State
 ---@field selected_id? string
 ---@field collapsed? boolean
@@ -30,6 +33,9 @@ local heading_namespace
 ---@field reply? ParleyKeymapKeys
 ---@field edit? ParleyKeymapKeys
 ---@field close? ParleyKeymapKeys
+---@field resolve? ParleyKeymapKeys
+---@field reopen? ParleyKeymapKeys
+---@field delete? ParleyKeymapKeys
 
 ---@class ParleyDiscussion.Options
 ---@field source_win integer
@@ -44,8 +50,10 @@ local heading_namespace
 ---@field composer_keymaps? ParleyComposer.Keymaps|false
 ---@field reply fun(parent_id: string?): ParleyDiscussion.Draft Return a retained draft with this exact parent.
 ---@field edit? fun(message_id: string): ParleyDiscussion.Draft Copy/resume a human revision draft.
----@field draft fun(): ParleyDiscussion.Draft? Current visible editable entry, owned by the host, not committed history.
+---@field draft fun(editing?: boolean): ParleyDiscussion.Draft? Visible draft, or retained edit buffer when editing=true.
+---@field response? fun(): ParleyDiscussion.Response? Transient request-correlated agent slot.
 ---@field changed fun() Refresh host cards after releasing room.
+---@field thread_action? fun(action: 'resolve'|'reopen'|'delete') Host-owned active-thread action.
 
 ---@class ParleyDiscussion.Reader
 ---@field buffer integer Disposable display only.
@@ -66,6 +74,7 @@ local heading_namespace
 ---@field closed boolean
 ---@field composing boolean
 ---@field draft? ParleyDiscussion.Draft
+---@field response? ParleyDiscussion.Response Last rendered slot; used only to replace the selected waiting entry.
 ---@field editor? ParleyComposer.Editor Borrowed presentation identity, never a draft owner.
 ---@field render_mode? 'expanded'|'collapsed'
 ---@field pending boolean
@@ -79,6 +88,9 @@ local defaults = {
     reply = "r",
     edit = { "e", "<CR>" },
     close = { "q", "<Esc>" },
+    resolve = "<leader>tr",
+    reopen = "<leader>tR",
+    delete = "<leader>td",
 }
 
 ---@param overrides? ParleyDiscussion.Keymaps|false
@@ -111,8 +123,12 @@ end
 ---@param id? string
 ---@return ParleyThread.Message? message
 ---@return ParleyDiscussion.Draft? draft
-local function get_entry(data, options, id)
-    local draft = options.draft()
+local function get_entry(data, options, id, composing)
+    local response = options.response and options.response()
+    if response and response.id == id then
+        return response
+    end
+    local draft = options.draft(composing)
     if draft and id == draft.entry_id then
         return {
             id = draft.entry_id,
@@ -130,12 +146,16 @@ local function get_entry(data, options, id)
     return id and thread.get(data, id) or nil
 end
 
-local function entry_ids(data, options)
+local function entry_ids(data, options, composing)
     local ids = {}
     for _, message in ipairs(data.messages) do
         ids[#ids + 1] = message.id
     end
-    local draft = options.draft()
+    local response = options.response and options.response()
+    if response then
+        ids[#ids + 1] = response.id
+    end
+    local draft = options.draft(composing)
     if draft then
         ids[#ids + 1] = draft.entry_id
     end
@@ -145,12 +165,44 @@ end
 -- One projection for both reading and editing: the selected entry and only its
 -- exact parent. A revision's replaces_id is identity, never alternate context.
 local function projection(view)
-    local selected, draft = get_entry(view.thread, view.options, view.state.selected_id)
+    local response = view.options.response and view.options.response()
+    local previous = view.response
+    view.response = response
+    -- Replace only a selected transient slot, never select an arriving reply
+    -- while the user is reading another entry or editing local prose.
+    if
+        previous
+        and not response
+        and view.state.selected_id == previous.id
+        and not view.composing
+    then
+        view.state.selected_id = previous.parent_id
+        for _, message in ipairs(view.thread.messages) do
+            if message.role == "agent" and message.parent_id == previous.parent_id then
+                view.state.selected_id = message.id
+                break
+            end
+        end
+    end
+    local pending = view.options.draft(true)
+    if
+        pending
+        and pending.accepted
+        and not view.composing
+        and not view.options.draft()
+        and view.state.selected_id == pending.entry_id
+    then
+        view.state.selected_id = pending.accepted.id
+        view.state.positions[pending.accepted.id] = view.state.positions[pending.accepted.id]
+            or view.state.positions[pending.entry_id]
+    end
+    local selected, draft =
+        get_entry(view.thread, view.options, view.state.selected_id, view.composing)
     local parent = selected and selected.parent_id and thread.get(view.thread, selected.parent_id)
     if view.state.collapsed and not view.composing then
         parent = nil
     end
-    local ids = entry_ids(view.thread, view.options)
+    local ids = entry_ids(view.thread, view.options, view.composing)
     local index = 0
     for position, id in ipairs(ids) do
         if selected and id == selected.id then
@@ -337,6 +389,7 @@ local function render_parent(view, width, resolved)
     local role = parent.role == "agent" and "Agent" or "You"
     local lines = {
         style.heading(parent, "parent", view.options.first, view.options.last, width, role),
+        "",
     }
     for _, line in ipairs(parent.lines) do
         lines[#lines + 1] = line
@@ -351,7 +404,11 @@ local function render(view, width, resolved)
     local label = message and message.role == "agent" and "Agent" or "You"
     local heading = style.heading(
         message or {},
-        (draft and "draft · %d/%d" or "read-only · %d/%d"):format(resolved.index, resolved.count),
+        message and message.state
+            or (draft and "draft · %d/%d" or "read-only · %d/%d"):format(
+                resolved.index,
+                resolved.count
+            ),
         view.options.first,
         view.options.last,
         width,
@@ -359,6 +416,7 @@ local function render(view, width, resolved)
     )
     local lines = { heading }
     if view.composing or not view.state.collapsed then
+        lines[#lines + 1] = ""
         if message then
             for _, line in ipairs(message.lines) do
                 lines[#lines + 1] = line
@@ -416,8 +474,10 @@ local function layout(view, reveal)
 
     local parent = resolved.parent
     local below = options.last < api.nvim_buf_line_count(view.source_buf) and 1 or 0
-    local overhead = (view.composing and 3 or 2) + (parent and 3 or 0)
-    local minimum = parent and 3 or 1
+    local overhead = (view.composing and 4 or 2) + (parent and 3 or 0)
+    local body_minimum = view.composing and 1 or math.min(3, #view.rendered)
+    local parent_minimum = parent and math.min(3, #view.parent.rendered) or 0
+    local minimum = body_minimum + parent_minimum
     local budget = (view.composing and height - 1 - below or math.floor(height / 2)) - overhead
     if budget < minimum then
         return
@@ -447,7 +507,11 @@ local function layout(view, reveal)
     local parent_desired = parent and text_height(view.parent) or 0
     local function allocate()
         local parent_height = parent
-                and math.min(parent_desired, math.max(2, math.floor(budget / 3)))
+                and math.min(
+                    parent_desired,
+                    math.max(parent_minimum, math.floor(budget / 3)),
+                    budget - body_minimum
+                )
             or 0
         view.height = math.min(desired, budget - parent_height)
         view.parent.height = parent and math.min(parent_desired, budget - view.height) or 0
@@ -472,7 +536,7 @@ local function layout(view, reveal)
         end
         local role = resolved.selected and resolved.selected.role or "human"
         local first = #room + 1
-        for _ = 1, view.height + (view.composing and 3 or 2) do
+        for _ = 1, view.height + (view.composing and 4 or 2) do
             room[#room + 1] = style.card_line(indent, width, padding, {}, active, role)
         end
         if view.composing then
@@ -551,7 +615,7 @@ local function layout(view, reveal)
     if view.composing then
         composer.place(
             view.editor,
-            vim.tbl_extend("force", config, { row = config.row + 1 }),
+            vim.tbl_extend("force", config, { row = config.row + 2 }),
             active
         )
     end
@@ -563,8 +627,8 @@ end
 ---@param reader ParleyDiscussion.Reader
 local function keep_cursor_in_body(reader)
     local cursor = api.nvim_win_get_cursor(reader.window)
-    if cursor[1] == 1 and api.nvim_buf_line_count(reader.buffer) > 1 then
-        api.nvim_win_set_cursor(reader.window, { 2, 0 })
+    if cursor[1] < 3 and api.nvim_buf_line_count(reader.buffer) >= 3 then
+        api.nvim_win_set_cursor(reader.window, { 3, 0 })
     end
 end
 
@@ -578,7 +642,7 @@ local function restore_position(view)
             api.nvim_win_call(reader.window, function()
                 vim.fn.winrestview(
                     view.state.positions[reader.rendered_id]
-                        or { lnum = 2, col = 0, topline = 1, topfill = 0 }
+                        or { lnum = 3, col = 0, topline = 1, topfill = 0 }
                 )
                 keep_cursor_in_body(reader)
             end)
@@ -622,6 +686,7 @@ function M.select(view, id)
     end
     remember_position(view)
     view.state.selected_id = id
+    view.state.collapsed = false
     local ids = entry_ids(view.thread, view.options)
     if ids[#ids] == id then
         view.state.seen_count = #view.thread.messages
@@ -686,7 +751,10 @@ local function compose(view, draft)
         not thread.get(view.thread, draft.entry_id),
         "Parley: draft entry ID conflicts with history"
     )
-    assert(view.options.draft() == draft, "Parley: composer must borrow the host's current draft")
+    assert(
+        view.options.draft(true) == draft,
+        "Parley: composer must borrow the host's current draft"
+    )
     if not api.nvim_buf_is_loaded(draft.buffer) then
         vim.notify("Parley: retained draft was deleted externally", vim.log.levels.WARN)
         return false
@@ -712,6 +780,7 @@ local function compose(view, draft)
             last = view.options.last,
             source_label = view.options.source_label,
             keymaps = view.options.composer_keymaps,
+            thread_action = view.options.thread_action,
             managed = true,
             changed = function()
                 if view.closed or view.draft ~= draft then
@@ -794,6 +863,13 @@ function M.reply(view)
     end
     if #view.thread.messages > 0 and not message then
         vim.notify("Parley: select an active message before replying", vim.log.levels.INFO)
+        return false
+    end
+    if message and message.origin == "request/activity" then
+        vim.notify(
+            "Parley: this reply is pending; select a committed message to compose a follow-up",
+            vim.log.levels.INFO
+        )
         return false
     end
     local draft = view.options.reply(view.state.selected_id)
@@ -912,6 +988,7 @@ function M.open(data, options)
     state.seen_count = state.seen_count or #data.messages
     if options.message_id ~= nil then
         state.selected_id = options.message_id
+        state.collapsed = false
     elseif not state.selected_id or not get_entry(data, options, state.selected_id) then
         local ids = entry_ids(data, options)
         state.selected_id = ids[#ids]
@@ -968,6 +1045,13 @@ function M.open(data, options)
                 M.close(view, true)
             end,
         }
+        if options.thread_action then
+            for _, name in ipairs({ "resolve", "reopen", "delete" }) do
+                actions[name] = function()
+                    options.thread_action(name)
+                end
+            end
+        end
         for _, name in ipairs({
             "next_message",
             "previous_message",
@@ -975,6 +1059,9 @@ function M.open(data, options)
             "reply",
             "edit",
             "close",
+            "resolve",
+            "reopen",
+            "delete",
         }) do
             for _, key in ipairs(actions[name] and bindings[name] or {}) do
                 vim.keymap.set(
@@ -985,6 +1072,10 @@ function M.open(data, options)
                 )
                 vim.keymap.set("n", key, function()
                     if not display_available(view) then
+                        return
+                    end
+                    if name == "resolve" or name == "reopen" or name == "delete" then
+                        actions[name]()
                         return
                     end
                     local id = view.parent.rendered_id

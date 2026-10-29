@@ -9,8 +9,14 @@ local M = {}
 ---@field edit? ParleyKeymapKeys Normal/Visual: resume or compose a note.
 ---@field enter? ParleyKeymapKeys Normal: read history or continue the previewed draft.
 ---@field reply? ParleyKeymapKeys Normal: reply directly to a thread preview (demo host).
+---@field resolve? ParleyKeymapKeys Normal: exclude the active thread from submissions.
+---@field reopen? ParleyKeymapKeys Normal: include the active thread in submissions.
+---@field delete? ParleyKeymapKeys Normal: confirm a local deleted marker.
 ---@field next? ParleyKeymapKeys Normal: visit the next note.
 ---@field previous? ParleyKeymapKeys Normal: visit the previous note.
+---@field resolve? ParleyKeymapKeys Normal: resolve the active thread.
+---@field reopen? ParleyKeymapKeys Normal: reopen the active thread.
+---@field delete? ParleyKeymapKeys Normal: mark the active thread deleted locally; preserve history.
 
 ---@class ParleyConfig.Keymaps
 ---@field review? ParleyConfig.ReviewKeymaps|false
@@ -30,8 +36,14 @@ local review_defaults = {
     edit = "C",
     enter = "<CR>",
     reply = false,
+    resolve = "<leader>tr",
+    reopen = "<leader>tR",
+    delete = "<leader>td",
     next = "<C-n>",
     previous = "<C-p>",
+    resolve = "<leader>tr",
+    reopen = "<leader>tR",
+    delete = "<leader>td",
 }
 
 ---@type ParleyConfig.Resolved

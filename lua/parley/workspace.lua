@@ -9,6 +9,7 @@ local keys = require("parley.composer.keymaps")
 local style = require("parley.composer.style")
 local M = {}
 local api = vim.api
+local spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
 ---@class ParleyWorkspace.Binding
 ---@field workspace string Canonical workspace root.
@@ -46,11 +47,12 @@ local api = vim.api
 ---@field drafts ParleyWorkspace.Drafts Borrowed from the conversation cache.
 ---@field keymaps ParleyConfig.Resolved Read-only configuration snapshot.
 ---@field bindings ParleyWorkspace.Keymap[] Keys installed for this activation.
+---@field reply_activity? { saved: table, responses: table<ParleyConversation, ParleyDiscussion.Response>, frame: integer, timer?: uv.uv_timer_t } One accepted request's transient UI.
 ---@field maps table<integer, table[]> Original mapping overrides by visited file buffer.
 ---@field views table<integer, ParleyConversation.Source> Owned source attachments.
 ---@field selection? { window: integer, buffer: integer, line: integer }
 ---@field refresh_pending? boolean
----@field selection_allowed? boolean Only explicit ReviewStart can select another review.
+---@field selection_allowed? boolean Only explicit :Parley start can select another review.
 
 ---@class ParleyWorkspace.Source
 ---@field review ParleyWorkspace.Active
@@ -157,7 +159,7 @@ end
 local function placed_items(review, buffer)
     local items = {}
     for _, note in ipairs(review.drafts.notes) do
-        if note.source_buf == buffer then
+        if not note.conversation.deleted and note.source_buf == buffer then
             local first, last = placement(review, note)
             if first and last then
                 items[#items + 1] = {
@@ -175,9 +177,18 @@ local function cache_status()
     local review = active
     M.status = ""
     if review then
-        M.status = ("Workspace review · %d notes"):format(#review.drafts.notes)
+        local count = 0
+        for _, note in ipairs(review.drafts.notes) do
+            if not note.conversation.deleted then
+                count = count + 1
+            end
+        end
+        M.status = ("Workspace review · %d notes"):format(count)
         if review.drafts.workflow == "parley" then
-            M.status = ("Parley implementation · %d notes"):format(#review.drafts.notes)
+            M.status = ("Parley implementation · %d notes"):format(count)
+        end
+        if review.reply_activity then
+            M.status = spinner_frames[review.reply_activity.frame] .. " " .. M.status
         end
         local note = review.drafts.selected
         if note then
@@ -798,7 +809,8 @@ function M.import_results(capture, groups)
         if not group.new then
             local baseline = saved.baselines[group.id]
             if
-                not baseline
+                data and data.deleted
+                or not baseline
                 or data ~= baseline.data
                 or not vim.deep_equal(data.thread, baseline.history)
             then
@@ -863,8 +875,143 @@ function M.import_results(capture, groups)
                 ),
         }
     end
+    saved.pending = false
     cache_status()
     return receipts
+end
+
+local function clear_reply_activity(review)
+    local owner = review.reply_activity
+    review.reply_activity = nil
+    local failure
+    if owner and owner.timer then
+        local stopped, stop_error = pcall(owner.timer.stop, owner.timer)
+        local closed, close_error = pcall(owner.timer.close, owner.timer)
+        failure = not stopped and stop_error or not closed and close_error or nil
+    end
+    for data, response in pairs(owner and owner.responses or {}) do
+        if data.response == response then
+            data.response = nil
+        end
+    end
+    if owner and active == review then
+        changed()
+    end
+    if failure then
+        error(failure, 0)
+    end
+end
+
+local function advance_reply_frame(owner)
+    owner.frame = owner.frame % #spinner_frames + 1
+    for _, response in pairs(owner.responses) do
+        response.lines = { spinner_frames[owner.frame] }
+    end
+end
+
+---Track each capture from upload through response delivery for deletion checks.
+---Only accepted requests get UI slots. An owned 80 ms timer animates glyphs;
+---it never polls Pi or changes durable evidence.
+function M.request_activity(capture, phase, activity)
+    local saved = requests[capture]
+    if not saved then
+        return
+    end
+    saved.pending = phase ~= nil
+    local review = saved.review
+    local labels = {
+        accepted = activity == "working" and "Agent working"
+            or activity == "starting" and "Agent starting"
+            or activity == "settling" and "Agent settling"
+            or "Accepted; awaiting agent",
+        downloading = "Receiving results",
+        applying = "Applying results / recording receipts",
+    }
+    local owner = review.reply_activity
+    if owner and owner.saved ~= saved then
+        return
+    end
+    if
+        active ~= review
+        or not labels[phase]
+        or not saved.accepted
+        or saved.incompatible
+        or review.drafts.review_id ~= saved.accepted.reviewId
+    then
+        clear_reply_activity(review)
+    else
+        if not owner then
+            owner = { saved = saved, responses = {}, frame = 0 }
+            for _, submission in ipairs(saved.snapshot.request.submissions) do
+                local baseline = saved.baselines[submission.conversationId]
+                if baseline then
+                    local response = {
+                        id = "pending/"
+                            .. saved.snapshot.request.id
+                            .. "/"
+                            .. submission.conversationId,
+                        parent_id = submission.tipId,
+                        role = "agent",
+                        origin = "request/activity",
+                        author = "Agent",
+                        created_at = os.time(),
+                        lines = {},
+                    }
+                    owner.responses[baseline.data] = response
+                    baseline.data.response = response
+                end
+            end
+            review.reply_activity = owner
+        end
+        advance_reply_frame(owner)
+        for _, response in pairs(owner.responses) do
+            response.state = "Reply pending · " .. labels[phase]
+        end
+    end
+    local function refresh()
+        local ok, failure = pcall(function()
+            if
+                active ~= review
+                or (saved.accepted and review.drafts.review_id ~= saved.accepted.reviewId)
+            then
+                if review.reply_activity == owner then
+                    clear_reply_activity(review)
+                end
+                return
+            end
+            refresh_sources(review)
+            for _, source in pairs(review.views) do
+                conversation.update_reply(source)
+            end
+            if owner and review.reply_activity == owner and not owner.timer then
+                owner.timer = assert(vim.uv.new_timer())
+                owner.timer:start(
+                    80,
+                    80,
+                    vim.schedule_wrap(function()
+                        if review.reply_activity == owner then
+                            advance_reply_frame(owner)
+                            refresh()
+                        end
+                    end)
+                )
+            end
+            changed()
+        end)
+        if not ok then
+            local cleaned, cleanup_error = true, nil
+            if review.reply_activity == owner then
+                cleaned, cleanup_error = pcall(clear_reply_activity, review)
+            end
+            vim.notify(
+                "Parley: reply activity presentation failed: "
+                    .. tostring(failure)
+                    .. (not cleaned and ("; cleanup: " .. tostring(cleanup_error)) or ""),
+                vim.log.levels.WARN
+            )
+        end
+    end
+    refresh()
 end
 
 ---@class ParleyWorkspace.RequestOptions
@@ -937,7 +1084,7 @@ function M.capture_request(options)
     if options.kind == "ask" then
         for _, note in ipairs(review.drafts.notes) do
             local captured, failure
-            if review.drafts.workflow ~= "parley" or not note.conversation.resolved then
+            if not note.conversation.deleted and not note.conversation.resolved then
                 captured, failure = conversation.capture(
                     note.conversation,
                     options.author,
@@ -1023,6 +1170,7 @@ function M.accept_request(capture, accepted)
     if not vim.deep_equal(request, saved.snapshot.request) then
         return nil, "durable acceptance does not match the exact captured request"
     end
+    saved.pending = true
     local applied, failure = conversation.accept(saved.batch)
     saved.accepted = vim.deepcopy(accepted)
     if not applied then
@@ -1046,27 +1194,115 @@ function M.accept_request(capture, accepted)
     return true
 end
 
----Resolution changes only the local turn filter. History, drafts, undo and
----selection survive. Reopening is explicit and never submits or runs tools.
-function M.resolve_note(resolved)
+-- Selection is a focused presentation or an explicitly selected source card
+-- at the cursor. Never use the workspace's remembered navigation selection.
+local function selected_note()
     local review = active
-    if not review or review.drafts.workflow ~= "parley" then
-        vim.notify("Parley: select an implementation interaction first", vim.log.levels.WARN)
-        return
+    if review then
+        local window = api.nvim_get_current_win()
+        local view = review.views[window]
+        -- Source edits can precede the scheduled display refresh. Validate
+        -- placement now so a stale card cannot authorize a thread action.
+        if view and workspace_source(review.workspace, window) == view.buffer then
+            conversation.refresh(view, placed_items(review, view.buffer))
+        end
     end
-    local note = review.drafts.selected
+    local data = conversation.active()
+    if active == review and review and data and not data.deleted then
+        for _, note in ipairs(review.drafts.notes) do
+            if note.conversation == data then
+                return review, note
+            end
+        end
+    end
+end
+
+local function active_note()
+    local review, note = selected_note()
+    if note then
+        return review, note
+    end
+    vim.notify("Parley: select a thread first", vim.log.levels.WARN)
+end
+
+---Resolution is a local submission filter in both workflows. It never submits.
+function M.resolve_note(resolved)
+    local review, note = active_note()
     if not note then
-        vim.notify("Parley: select a conversation first", vim.log.levels.WARN)
         return
     end
     note.conversation.resolved = resolved ~= false
     refresh_sources(review)
     changed()
     vim.notify(
-        note.conversation.resolved and "Parley: conversation resolved; excluded from turns"
-            or "Parley: conversation reopened; drafts retained",
+        note.conversation.resolved and "Parley: thread resolved; excluded from turns"
+            or "Parley: thread reopened; drafts retained",
         vim.log.levels.INFO
     )
+end
+
+local function awaiting_response(review, data)
+    for _, saved in pairs(requests) do
+        if saved.review == review and saved.pending then
+            for _, submission in ipairs(saved.snapshot.request.submissions) do
+                if submission.conversationId == data.thread.id then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+---Mark only the active thread deleted. Keep its history, anchors, drafts and
+---undo for inspection; deletion never rewrites submitted Pi evidence.
+function M.delete_note()
+    local review, note = active_note()
+    if not note then
+        return
+    end
+    local data = note.conversation
+    local function blocked()
+        if awaiting_response(review, data) then
+            vim.notify(
+                "Parley: thread is awaiting a response; deletion blocked",
+                vim.log.levels.WARN
+            )
+            return true
+        end
+        return false
+    end
+    if blocked() then
+        return
+    end
+    vim.ui.select({ "Cancel", "Delete" }, {
+        prompt = "Delete thread " .. data.thread.id .. "? History and drafts stay local.",
+    }, function(choice)
+        if choice ~= "Delete" then
+            return
+        end
+        -- A picker can finish after selection, request or workspace changes.
+        local current_review, current_note = selected_note()
+        if current_review ~= review or current_note ~= note or data.deleted then
+            vim.notify("Parley: thread selection changed; deletion cancelled", vim.log.levels.WARN)
+            return
+        end
+        if blocked() then
+            return
+        end
+        data.deleted = true
+        if review.drafts.selected == note then
+            review.drafts.selected = nil
+            review.selection = nil
+        end
+        conversation.hide(data)
+        refresh_sources(review)
+        changed()
+        vim.notify(
+            "Parley: thread deleted locally; history and drafts retained",
+            vim.log.levels.INFO
+        )
+    end)
 end
 
 ---Resume a selected/overlapping note; C creates a line note only when absent.
@@ -1097,7 +1333,9 @@ function M.move_note(step)
     local drafts = review.drafts
     local notes = {}
     for _, note in ipairs(review.drafts.notes) do
-        notes[#notes + 1] = { note = note, first = placement(review, note) or note.first }
+        if not note.conversation.deleted then
+            notes[#notes + 1] = { note = note, first = placement(review, note) or note.first }
+        end
     end
     if #notes == 0 then
         vim.notify("Parley: no local notes yet", vim.log.levels.INFO)
@@ -1212,6 +1450,14 @@ function M.move_note(step)
     show(review, note, source.window, false)
 end
 
+local function thread_action(action)
+    if action == "delete" then
+        M.delete_note()
+    else
+        M.resolve_note(action == "resolve")
+    end
+end
+
 -- Fixed order also defines precedence if configured actions share a key.
 local review_actions = {
     {
@@ -1253,6 +1499,28 @@ local review_actions = {
             M.edit_note()
         end,
         description = "Edit the selected local note",
+    },
+    {
+        mode = "n",
+        name = "resolve",
+        action = function()
+            M.resolve_note(true)
+        end,
+        description = "Resolve the active thread",
+    },
+    {
+        mode = "n",
+        name = "reopen",
+        action = function()
+            M.resolve_note(false)
+        end,
+        description = "Reopen the active thread",
+    },
+    {
+        mode = "n",
+        name = "delete",
+        action = M.delete_note,
+        description = "Mark the active thread deleted locally",
     },
     {
         mode = "n",
@@ -1346,6 +1614,7 @@ local function visit_buffer(review)
                 items = {},
                 keymaps = review.keymaps,
                 source_maps = false,
+                thread_action = thread_action,
                 enabled = function()
                     return active == review
                         and workspace_source(review.workspace, window) == buffer
@@ -1388,7 +1657,8 @@ function M.can_activate(binding)
     if
         active and (active.workspace ~= binding.workspace or active.sessionId ~= binding.sessionId)
     then
-        return false, "Another workspace/Pi session is active; :ReviewStop before starting another"
+        return false,
+            "Another workspace/Pi session is active; :Parley stop before starting another"
     end
     if vim.fn.mode() ~= "n" or not workspace_source(binding.workspace) then
         return false,
@@ -1506,7 +1776,7 @@ function M.activate(binding)
     return true
 end
 
----Explicit ReviewStart permits selecting a newly initialized review on the next
+---Explicit :Parley start permits selecting a newly initialized review on the next
 ---request. Passive health/reconnection never calls this or moves drafts.
 function M.allow_review_selection()
     if active then
@@ -1531,7 +1801,7 @@ function M.select_review(review_id, workflow)
     end
     local review = active
     if not review then
-        return nil, "Use :ReviewStart before selecting a review"
+        return nil, "Use :Parley start review before selecting a review"
     end
     if review.drafts.review_id == review_id then
         if (review.drafts.workflow or "review") ~= workflow then
@@ -1542,7 +1812,7 @@ function M.select_review(review_id, workflow)
     end
     if review.drafts.review_id and not review.selection_allowed then
         return nil,
-            "Review changed; run :ReviewStart explicitly to select the new review. Old notes will remain retained."
+            "Review changed; run :Parley start with the matching workflow explicitly to select the new review. Old notes will remain retained."
     end
     local sessions = review_drafts[review.workspace] or {}
     review_drafts[review.workspace] = sessions
@@ -1591,6 +1861,9 @@ function M.stop()
             failed, failure = true, err
         end
     end
+    finish(function()
+        clear_reply_activity(review)
+    end)
     finish(function()
         api.nvim_del_augroup_by_id(review.group)
     end)

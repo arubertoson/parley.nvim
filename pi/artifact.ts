@@ -114,6 +114,13 @@ export type RequestRecord = RecordIdentity & {
   readonly submissions: readonly Submission[];
 };
 
+// Normal final reviewer prose, not a host verdict or another model turn.
+export type RequestExplanationRecord = RecordIdentity & {
+  readonly type: "request-explanation";
+  readonly requestId: string;
+  readonly text: string;
+};
+
 export type OutcomeRecord = RecordIdentity & {
   readonly type: "outcome";
   readonly requestId: string;
@@ -140,7 +147,7 @@ export type ReviewEndRecord = RecordIdentity & {
 
 export type ArtifactRecord = ReviewHeader | SessionRecord | SessionEndRecord
   | PreparationRecord | ConversationRecord | MessageRecord | RequestRecord
-  | OutcomeRecord | ApplicationRecord | ReviewEndRecord;
+  | RequestExplanationRecord | OutcomeRecord | ApplicationRecord | ReviewEndRecord;
 
 export type ConversationHistory = {
   readonly record: ConversationRecord;
@@ -158,7 +165,7 @@ export type ReviewArtifactSnapshot = {
   readonly sessions: readonly { readonly record: SessionRecord; readonly end?: SessionEndRecord }[];
   readonly preparations: readonly PreparationRecord[];
   readonly conversations: readonly ConversationHistory[];
-  readonly requests: readonly { readonly record: RequestRecord; readonly outcome?: OutcomeRecord }[];
+  readonly requests: readonly { readonly record: RequestRecord; readonly explanation?: RequestExplanationRecord; readonly outcome?: OutcomeRecord }[];
   readonly applications: readonly ApplicationRecord[];
   // Complete lines without their accepting marker, e.g. an interrupted append.
   // They remain inspectable but never change a conversation's active history.
@@ -405,6 +412,14 @@ export function parseArtifactRecord(value: unknown): ArtifactRecord {
       requireCondition(new Set(submissions.map(item => item.conversationId)).size === submissions.length, "duplicate submitted conversation");
       return { ...base, type: "request", kind, preparationId: identifier(record.preparationId), instructions, submissions };
     }
+    case "request-explanation": {
+      fields(record, [...common, "requestId", "text"]);
+      const explanation = nonempty(record.text);
+      requireCondition(Buffer.byteLength(explanation) <= 16 * 1024 && Buffer.from(explanation).toString("utf8") === explanation
+        && !/[\x00-\x08\x0b-\x1f\x7f]/.test(explanation),
+        "reviewer explanation exceeds 16 KiB or contains invalid text/control characters");
+      return { ...base, type: "request-explanation", requestId: identifier(record.requestId), text: explanation };
+    }
     case "outcome": {
       fields(record, [...common, "requestId", "status", "detail"]);
       const status = choice(record.status, ["completed", "failed", "cancelled"]);
@@ -494,7 +509,7 @@ function reconstruct(records: readonly ArtifactRecord[], filename: string): Revi
   const conversations = new Map<string, MutableConversationHistory>();
   const messages = new Map<string, MessageRecord>();
   const pendingCaptures = new Map<string, MessageRecord[]>();
-  const requests = new Map<string, { record: RequestRecord; outcome?: OutcomeRecord }>();
+  const requests = new Map<string, { record: RequestRecord; explanation?: RequestExplanationRecord; outcome?: OutcomeRecord }>();
   const applications: ApplicationRecord[] = [];
   const appliedMessagesByEditor = new Map<string, Set<string>>();
   let activeRequestId: string | null = null;
@@ -604,6 +619,15 @@ function reconstruct(records: readonly ArtifactRecord[], filename: string): Revi
           pendingCaptures.delete(record.id);
           requests.set(record.id, { record });
           activeRequestId = record.id;
+          break;
+        }
+        case "request-explanation": {
+          const request = requests.get(record.requestId);
+          requireCondition(header.type === "review" && request && request.record.kind !== "wrap-up"
+            && !request.explanation && !request.outcome && activeRequestId === record.requestId
+            && [...sessions.values()].some(item => item.record.role === "review" && !item.end),
+          "explanation requires this active request's recorded reviewer; no duplicate or late explanation");
+          request.explanation = record;
           break;
         }
         case "outcome": {

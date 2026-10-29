@@ -17,6 +17,9 @@ local actions = {
     receipt = "review-result-receipt",
 }
 local pending
+-- Latest durably acknowledged review request only, retained across disconnect.
+-- Identity is frozen at acceptance; result caching never depends on note import.
+local latest_report
 ---@class ParleyInteraction.Status
 ---@field phase 'idle'|'checking'|'capturing'|'uploading'|'awaiting-acceptance'|'accepted'|'downloading'|'applying'|'completed'|'failed'|'cancelled'|'wrapping'|'review-completed'
 ---@field accepted boolean Durable acceptance only, not publication/application.
@@ -42,6 +45,13 @@ local function publish(value)
         return
     end
     status = value
+    if
+        latest_report
+        and value.batchId == latest_report.requestId
+        and value.reviewId == latest_report.reviewId
+    then
+        latest_report.status = vim.deepcopy(value)
+    end
     vim.api.nvim_exec_autocmds("User", { pattern = "ParleyRequestChanged", data = M.status() })
 end
 
@@ -62,6 +72,11 @@ local function fields(value, names)
         end
     end
     return true
+end
+
+---Copied cached evidence only; opening a view never retrieves/replays work.
+function M.request_report()
+    return latest_report and vim.deepcopy(latest_report) or nil
 end
 
 local function discovery(info)
@@ -91,6 +106,13 @@ end
 ---@param kind 'ask'|'investigate'
 ---@param instructions? string
 function M.submit(kind, instructions, workflow)
+    if kind == "investigate" and workspace.workflow() == "parley" then
+        vim.notify(
+            "Parley: investigation is only available in the review workflow",
+            vim.log.levels.ERROR
+        )
+        return
+    end
     workflow = workflow or "review"
     if pending then
         vim.notify("Parley: request transport is busy; nothing queued", vim.log.levels.WARN)
@@ -98,7 +120,10 @@ function M.submit(kind, instructions, workflow)
     end
     local pairing = bridge.status()
     if not workspace.is_active() or not pairing.connected or not pairing.binding then
-        vim.notify("Parley: use :ReviewStart to pair and activate first", vim.log.levels.ERROR)
+        vim.notify(
+            "Parley: use :Parley start with the matching workflow to pair and activate first",
+            vim.log.levels.ERROR
+        )
         return
     end
     local endpoint = assert(pairing.binding)
@@ -112,6 +137,7 @@ function M.submit(kind, instructions, workflow)
     local accepted = false
     local application
     local outcome, results, receipt_status, acceptance_error
+    local request_capture
     local poll_timer, group
     local function cleanup()
         local failure
@@ -122,6 +148,11 @@ function M.submit(kind, instructions, workflow)
             end
         end
         local timer, owned_group = poll_timer, group
+        if request_capture then
+            finish(function()
+                workspace.request_activity(request_capture, nil)
+            end)
+        end
         poll_timer, group = nil, nil
         if timer then
             finish(function()
@@ -170,6 +201,9 @@ function M.submit(kind, instructions, workflow)
         vim.notify("Parley: " .. context .. tostring(err), vim.log.levels.ERROR)
     end
     local function phase(name, activity)
+        if request_capture then
+            workspace.request_activity(request_capture, name, activity)
+        end
         publish({
             phase = name,
             batchId = batch_id,
@@ -259,11 +293,15 @@ function M.submit(kind, instructions, workflow)
         local function apply(bytes, download)
             ---@type unknown
             local result = vim.json.decode(bytes)
+            local envelope = fields(
+                result,
+                { "reviewId", "requestId", "sessionId", "outcome", "conversations" }
+            ) or fields(
+                result,
+                { "reviewId", "requestId", "sessionId", "outcome", "conversations", "report" }
+            )
             require_condition(
-                fields(
-                    result,
-                    { "reviewId", "requestId", "sessionId", "outcome", "conversations" }
-                )
+                envelope
                     and result.reviewId == review_id
                     and result.requestId == batch_id
                     and (result.sessionId == vim.NIL or identifier(result.sessionId)),
@@ -285,6 +323,7 @@ function M.submit(kind, instructions, workflow)
                 type(result.conversations) == "table" and vim.islist(result.conversations),
                 "Invalid result conversation array"
             )
+            local delivered_messages, delivered_findings = 0, 0
             for _, conversation in ipairs(result.conversations) do
                 require_condition(
                     type(conversation) == "table"
@@ -293,6 +332,10 @@ function M.submit(kind, instructions, workflow)
                         and conversation.id ~= completion.id,
                     "Invalid result conversation/messages"
                 )
+                delivered_messages = delivered_messages + #conversation.messages
+                if conversation.new == true then
+                    delivered_findings = delivered_findings + 1
+                end
                 for _, message in ipairs(conversation.messages) do
                     require_condition(
                         type(message) == "table"
@@ -303,12 +346,59 @@ function M.submit(kind, instructions, workflow)
                     )
                 end
             end
+            if result.report ~= nil then
+                local projection = result.report
+                require_condition(
+                    workflow == "review"
+                        and fields(
+                            projection,
+                            { "publishedMessages", "newFindings", "explanation" }
+                        )
+                        and timestamp(projection.publishedMessages)
+                        and timestamp(projection.newFindings)
+                        and projection.newFindings <= projection.publishedMessages
+                        and projection.publishedMessages == delivered_messages
+                        and projection.newFindings == delivered_findings
+                        and (
+                            projection.explanation == vim.NIL
+                            or (
+                                type(projection.explanation) == "string"
+                                and #projection.explanation <= 16 * 1024
+                                and projection.explanation:find("%S")
+                                and not projection.explanation:find("[%z\1-\8\11-\31\127]")
+                            )
+                        ),
+                    "Invalid bounded request report projection"
+                )
+            end
+            if workflow == "review" then
+                local current = bridge.status()
+                require_condition(
+                    current.binding
+                        and current.binding.workspace == endpoint.workspace
+                        and current.connected
+                        and current.binding.sessionId == endpoint.sessionId
+                        and current.binding.instanceId == endpoint.instanceId
+                        and current.editor_id == pairing.editor_id
+                        and workspace.is_active()
+                        and workspace.review_id() == review_id
+                        and latest_report
+                        and latest_report.workspace == endpoint.workspace
+                        and latest_report.sessionId == endpoint.sessionId
+                        and latest_report.requestId == batch_id
+                        and latest_report.reviewId == review_id,
+                    "Report owner changed; no retargeting"
+                )
+                latest_report.projection = result.report and vim.deepcopy(result.report) or nil
+                latest_report.reviewerSessionId = result.sessionId
+            end
             outcome = completion
             phase("applying")
             local facts, failure = workspace.import_results(capture, result.conversations)
             if not facts then
                 error("Result import rejected without retargeting: " .. tostring(failure), 0)
             end
+            workspace.request_activity(capture, nil)
             results = { applied = 0, incompatible = 0, unplaced = 0 }
             local published_messages = 0
             for _, fact in ipairs(facts) do
@@ -534,7 +624,7 @@ function M.submit(kind, instructions, workflow)
             )
             require_condition(
                 not info.ended,
-                "Review is completed. Use /review in Pi, then :ReviewStart to select the new review."
+                "Review is completed. Use /parley review in Pi, then :Parley start review to select the new review."
             )
             local selected, selection_error = workspace.select_review(info.reviewId, info.workflow)
             require_condition(selected, selection_error)
@@ -556,6 +646,7 @@ function M.submit(kind, instructions, workflow)
                     and capture.editorId == pairing.editor_id,
                 "Capture no longer matches the verified pairing"
             )
+            request_capture = capture
             local bytes = vim.json.encode(capture)
             require_condition(
                 #bytes > 0 and #bytes <= max_batch_bytes,
@@ -584,6 +675,31 @@ function M.submit(kind, instructions, workflow)
                         "Invalid durable acceptance; delivery may be unknown, no replay"
                     )
                     accepted = true
+                    if workflow == "review" then
+                        local scope = {}
+                        for index, submission in ipairs(capture.request.submissions) do
+                            local anchor = capture.conversations[index].anchor
+                            scope[#scope + 1] = {
+                                conversationId = submission.conversationId,
+                                path = anchor.path,
+                                side = anchor.side,
+                                first = anchor.first,
+                                last = anchor.last,
+                                version = submission.version,
+                                messages = #submission.messageIds,
+                            }
+                        end
+                        latest_report = {
+                            workspace = endpoint.workspace,
+                            sessionId = endpoint.sessionId,
+                            reviewId = review_id,
+                            requestId = batch_id,
+                            kind = capture.request.kind,
+                            instructions = capture.request.instructions,
+                            acceptedAt = result.createdAt,
+                            scope = scope,
+                        }
+                    end
                     -- The exact digest attests all copied submissions, including their
                     -- versions, parent tips and message IDs. Avoid echoing a potentially
                     -- multi-megabyte request into a single acknowledgment frame.
@@ -602,6 +718,7 @@ function M.submit(kind, instructions, workflow)
                             vim.log.levels.WARN
                         )
                     end
+                    workspace.request_activity(capture, "accepted")
                     publish({
                         phase = "accepted",
                         accepted = true,
@@ -652,7 +769,7 @@ function M.submit(kind, instructions, workflow)
     end
 end
 
----Capture-free selection after explicit ReviewStart. Select an initialized fresh
+---Capture-free selection after explicit :Parley start. Select an initialized fresh
 ---review before the user composes its notes, not by migrating old notes on Ask.
 function M.select_prepared(workflow)
     workflow = workflow or "review"
@@ -687,7 +804,7 @@ function M.select_prepared(workflow)
             or vim.api.nvim_win_get_buf(window) ~= buffer
         then
             vim.notify(
-                "Parley: source focus changed; run :ReviewStart again to select the review",
+                "Parley: source focus changed; run :Parley start with the matching workflow again",
                 vim.log.levels.WARN
             )
             return
@@ -699,10 +816,10 @@ function M.select_prepared(workflow)
         end
         vim.notify(
             workflow == "parley"
-                    and "Parley: implementation ready — :ParleyTurn, :ParleyResolve, :ParleyDone"
-                or info.ended and "Parley: review already completed; :ReviewDone shows its summary"
+                    and "Parley: implementation ready — :Parley submit, :Parley thread resolve, :Parley done"
+                or info.ended and "Parley: review already completed; :Parley done shows its summary"
                 or info.busy and "Parley: paired; review work is active"
-                or "Parley: review ready — :ReviewInvestigate or :ReviewAsk",
+                or "Parley: review ready — :Parley investigate <instructions> or :Parley submit",
             vim.log.levels.INFO
         )
     end)
@@ -726,7 +843,10 @@ function M.done(requested_review, workflow)
     end
     local pairing = bridge.status()
     if not workspace.is_active() or not pairing.connected or not pairing.binding then
-        vim.notify("Parley: use :ReviewStart to pair and activate first", vim.log.levels.ERROR)
+        vim.notify(
+            "Parley: use :Parley start with the matching workflow to pair and activate first",
+            vim.log.levels.ERROR
+        )
         return
     end
     if requested_review and not identifier(requested_review) then
@@ -775,7 +895,7 @@ function M.done(requested_review, workflow)
             vim.notify(
                 "Parley: review completed, but presentation failed: "
                     .. detail
-                    .. ". Run :ReviewDone again to view the saved summary.",
+                    .. ". Run :Parley done again to view the saved summary.",
                 vim.log.levels.ERROR
             )
             return
@@ -784,7 +904,7 @@ function M.done(requested_review, workflow)
         vim.notify(
             "Parley: "
                 .. detail
-                .. ". Completion may be unknown; inspect evidence or explicitly run :ReviewDone again. No automatic replay.",
+                .. ". Completion may be unknown; inspect evidence or explicitly run :Parley done again. No automatic replay.",
             vim.log.levels.ERROR
         )
     end
@@ -862,7 +982,7 @@ function M.done(requested_review, workflow)
             error = result.cleanupError ~= vim.NIL and result.cleanupError or cleanup_error,
         })
         vim.notify(
-            "Parley: review completed. Unsubmitted drafts retained. Use /review in Pi, then :ReviewStart.",
+            "Parley: review completed. Unsubmitted drafts retained. Use /parley review in Pi, then :Parley start review.",
             vim.log.levels.INFO
         )
         if result.cleanupError ~= vim.NIL or cleanup_error then
@@ -886,13 +1006,13 @@ function M.done(requested_review, workflow)
                 vim.notify(
                     "Parley: review completed, but summary display failed: "
                         .. tostring(show_error)
-                        .. ". Run :ReviewDone again to view it.",
+                        .. ". Run :Parley done again to view it.",
                     vim.log.levels.ERROR
                 )
             end
         else
             vim.notify(
-                "Parley: summary saved; run :ReviewDone "
+                "Parley: summary saved; run :Parley done "
                     .. review_id
                     .. " to view it. Focus left unchanged.",
                 vim.log.levels.INFO

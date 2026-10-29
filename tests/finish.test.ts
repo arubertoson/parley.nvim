@@ -62,7 +62,7 @@ type ParentHost = {
   readonly stateDirectory: string;
   readonly messages: readonly ParentMessage[];
   readonly notices: readonly string[];
-  command(name: "review" | "review-done", args?: string): Promise<void>;
+  command(name: "parley", args?: string): Promise<void>;
   prepare(callId: string): ReturnType<ToolDefinition["execute"]>;
 };
 
@@ -207,11 +207,11 @@ test("Done rejects staging, records a pre-acceptance failure without ending, and
   assert.deepEqual(await fs.readFile(failedCompletion.artifactPath), corruptedEvidence);
 });
 
-test("/review creates empty reviews, starts a fresh identity after Done, and retains old summaries", async t => {
+test("/parley review creates empty reviews, starts a fresh identity after Done, and retains old summaries", async t => {
   const host = await createParentHost(t);
   const { messages, notices } = host;
-  await host.command("review");
-  await host.command("review-done");
+  await host.command("parley", "review");
+  await host.command("parley", "done");
   assert.equal(messages.length, 1, notices.join("\n"));
   const firstMessage = messages[0];
   assert(firstMessage && typeof firstMessage.content === "string", "Done delivers a text summary");
@@ -220,19 +220,19 @@ test("/review creates empty reviews, starts a fresh identity after Done, and ret
 
   const reviewsDirectory = path.join(host.stateDirectory, "reviews");
   const files = (await fs.readdir(reviewsDirectory)).filter(name => name.endsWith(".jsonl"));
-  assert.equal(files.length, 1, "/review creates one durable context-free review");
+  assert.equal(files.length, 1, "/parley review creates one durable context-free review");
   const [firstArtifactFilename] = files;
   assert(firstArtifactFilename, "The completed review has an artifact");
   const firstArtifact = await readReviewArtifact(path.join(reviewsDirectory, firstArtifactFilename));
   assert.equal(firstArtifact.end?.summary, firstMessage.content);
 
-  await host.command("review");
+  await host.command("parley", "review");
   await host.prepare("optional-handoff");
   assert.equal(messages.length, 1, "Fresh review and optional handoff do not inject a parent summary");
-  await host.command("review-done");
+  await host.command("parley", "done");
   assert.equal(messages.length, 2);
   assert.notEqual(firstMessage.content, messages[1].content);
-  await host.command("review-done", firstArtifact.header.id);
+  await host.command("parley", "done " + firstArtifact.header.id);
   assert.equal(messages.length, 3);
   assert.equal(messages[2].content, firstMessage.content);
   assert(!notices.some(message => /requires|failed|unavailable/i.test(message)), notices.join("\n"));

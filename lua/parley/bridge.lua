@@ -1,5 +1,5 @@
 ---Explicit review pairing over the existing socket. Startup/require acquire nothing.
----Only ReviewStart discovers an offer; subsequent reconnects retain its workspace
+---Only :Parley start discovers an offer; subsequent reconnects retain its workspace
 ---and Pi session. Presentation/history survive disconnects, never migrate sessions.
 local client = require("parley.client")
 local workspace = require("parley.workspace")
@@ -223,7 +223,7 @@ local function disconnect()
     end
 end
 
----ReviewStop releases the editor slot, not Pi leadership or local history/drafts.
+---:Parley stop releases the editor slot, not Pi leadership or local history/drafts.
 function M.stop()
     local closed, failure = pcall(disconnect)
     root, status.last_result = nil, nil
@@ -254,7 +254,7 @@ local function endpoint_for(workspace_root)
     client.endpoints(workspace_root, function(endpoints, err)
         if not endpoints then
             failure = (err or "No review offer")
-                .. "; run /review in the leading Pi, then :ReviewStart"
+                .. "; run /parley review in the leading Pi, then :Parley start review (or /parley and :Parley start for implementation)"
         elseif #endpoints ~= 1 then
             failure = "Ambiguous Pi workspace owners; no connection made"
         else
@@ -266,7 +266,7 @@ local function endpoint_for(workspace_root)
                 or endpoint.sessionId == ""
             then
                 failure =
-                    "Pi offer has no runtime/session identity; run /review in the updated Pi extension"
+                    "Pi offer has no runtime/session identity; run /parley review (or /parley for implementation) in the updated Pi extension"
             else
                 ---@cast endpoint ParleyBridge.Endpoint
                 result = endpoint
@@ -458,7 +458,7 @@ local function tick()
         stopped = true
         report(
             "rebind-required",
-            "Pi session changed; run /review there, then :ReviewStop and :ReviewStart here"
+            "Pi session changed; run /parley review there, then :Parley stop and :Parley start review here (or /parley and :Parley start for implementation)"
         )
         return
     end
@@ -506,7 +506,7 @@ function M.activate(workflow)
         binding
         and (binding.workspace ~= endpoint.workspace or binding.sessionId ~= endpoint.sessionId)
     then
-        reject(":ReviewStop before pairing another workspace/Pi session")
+        reject(":Parley stop before pairing another workspace/Pi session")
         return
     end
     local selected = {

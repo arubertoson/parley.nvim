@@ -9,7 +9,7 @@ import { once } from "node:events";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
 import { registerHooks } from "node:module";
-import { setImmediate } from "node:timers/promises";
+import { setImmediate, setTimeout } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import extension from "../pi/extension.ts";
 import { readReviewArtifact } from "../pi/artifact.ts";
@@ -39,6 +39,7 @@ type ParentHost = {
   readonly state: string;
   readonly notices: string[];
   readonly messages: unknown[];
+  readonly messageOptions: unknown[];
   readonly statuses: Map<string, string | undefined>;
   command(name: string, args?: string): Promise<void>;
   tool(name: string, value: unknown, signal?: AbortSignal): ReturnType<ToolDefinition["execute"]>;
@@ -65,6 +66,7 @@ async function createParentHost(t: TestContext, options: HostOptions = {}): Prom
   const events = new Map<string, (_event: unknown, ctx: ExtensionContext) => Promise<void>>();
   const notices: string[] = [];
   const messages: unknown[] = [];
+  const messageOptions: unknown[] = [];
   const statuses = new Map<string, string | undefined>();
   // No internal collaborators are mocked. Parent commands use the real owners,
   // sockets and artifacts; accepted requests use the offline SDK boundary fake.
@@ -74,7 +76,7 @@ async function createParentHost(t: TestContext, options: HostOptions = {}): Prom
     registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
     on: (name: string, handler: (_event: unknown, ctx: ExtensionContext) => Promise<void>) => events.set(name, handler),
     exec: options.exec ?? (async () => commitResult),
-    sendMessage(message: unknown) { messages.push(message); },
+    sendMessage(message: unknown, options: unknown) { messages.push(message); messageOptions.push(options); },
   } as unknown as ExtensionAPI;
   const ctx = {
     get cwd() { return options.getCwd ? options.getCwd(root) : root; },
@@ -90,7 +92,7 @@ async function createParentHost(t: TestContext, options: HostOptions = {}): Prom
       setStatus: (key: string, value: string | undefined) => statuses.set(key, value) },
   } as unknown as ExtensionCommandContext;
   const host: ParentHost = {
-    root, state, notices, messages, statuses,
+    root, state, notices, messages, messageOptions, statuses,
     async command(name, args = "") {
       const command = commands.get(name);
       assert(command, `Command ${name} is registered`);
@@ -230,7 +232,7 @@ test("pickup and cancellation reject malformed exact IDs before looking up an ow
   }
 });
 
-test("/review initializes durable context-free evidence and captures Git or jj commits only once", async t => {
+test("/parley review initializes durable context-free evidence and captures Git or jj commits only once", async t => {
   const calls: Parameters<ExtensionAPI["exec"]>[] = [];
   let result = commitResult;
   const host = await createParentHost(t, {
@@ -243,12 +245,12 @@ test("/review initializes durable context-free evidence and captures Git or jj c
     { ...commitResult, stdout: "not-a-commit" },
   ]) {
     result = failure;
-    await host.command("review");
+    await host.command("parley", "review");
     assert.match(String(host.notices.at(-1)), /Cannot capture the starting commit/);
     assert.deepEqual(await fs.readdir(host.state), ["endpoints"]);
   }
   result = { ...commitResult, stdout: ` ${"b".repeat(40)}\n` };
-  await host.command("review");
+  await host.command("parley", "review");
   assert.deepEqual(calls.at(-1), ["git", ["rev-parse", "HEAD"], { cwd: host.root, timeout: 10_000, signal: undefined }]);
   const { filename: artifactPath, snapshot: artifact } = await currentArtifact(host);
   assert.deepEqual(artifact.records.map(record => record.type), ["review", "session", "preparation"]);
@@ -260,8 +262,8 @@ test("/review initializes durable context-free evidence and captures Git or jj c
   assert.equal(sdk.creations, 0);
 
   const callsBeforeRepeat = calls.length;
-  await host.command("review");
-  assert.equal(calls.length, callsBeforeRepeat, "Repeated /review does not reinitialize an open review");
+  await host.command("parley", "review");
+  assert.equal(calls.length, callsBeforeRepeat, "Repeated /parley review does not reinitialize an open review");
   assert.deepEqual((await readReviewArtifact(artifactPath)).records, artifact.records);
   assert.equal(artifact.header.startingCommit, "b".repeat(40));
   const evidence = await fs.readFile(artifactPath);
@@ -272,9 +274,9 @@ test("/review initializes durable context-free evidence and captures Git or jj c
   });
   assert.deepEqual(await fs.readFile(artifactPath), evidence, "Pickup does not append or rewrite evidence");
 
-  await host.command("review-done");
+  await host.command("parley", "done");
   await fs.mkdir(path.join(host.root, ".jj"));
-  await host.command("review");
+  await host.command("parley", "review");
   assert.deepEqual(calls.at(-1), ["jj", ["--ignore-working-copy", "log", "-r", "@", "--no-graph", "-T", "commit_id"],
     { cwd: host.root, timeout: 10_000, signal: undefined }]);
   assert.equal((await fs.readdir(path.join(host.state, "reviews"))).length, 2);
@@ -290,16 +292,16 @@ test("initialization blocks requests and Done until durable readiness, without s
   const host = await createParentHost(t, {
     exec: async () => { started.resolve(); return commit.promise; },
   });
-  const startup = host.command("review");
+  const startup = host.command("parley", "review");
   try {
     await started.promise;
     const editor = await attachEditor(t, host);
     await assert.rejects(editor.request("review-info"), /initialization is active/);
-    await host.command("review-done");
+    await host.command("parley", "done");
     assert.match(String(host.notices.at(-1)), /Nothing queued/);
-    await host.command("review-stop");
+    await host.command("parley", "stop");
     assert.match(String(host.notices.at(-1)), /Nothing queued or cancelled/);
-    await host.command("review");
+    await host.command("parley", "review");
     assert.match(String(host.notices.at(-1)), /busy/);
     assert.equal(sdk.creations, 0);
     commit.resolve(commitResult);
@@ -311,7 +313,7 @@ test("initialization blocks requests and Done until durable readiness, without s
   }
 });
 
-test("a fresh /review retains exact old completion reads while its new identity initializes", async t => {
+test("a fresh /parley review retains exact old completion reads while its new identity initializes", async t => {
   const started = Promise.withResolvers<void>();
   const commit = Promise.withResolvers<typeof commitResult>();
   let startingFresh = false;
@@ -324,17 +326,17 @@ test("a fresh /review retains exact old completion reads while its new identity 
       return commitResult;
     },
   });
-  await host.command("review");
+  await host.command("parley", "review");
   const editor = await attachEditor(t, host);
   const firstInfo = await editor.request("review-info");
   const reviewId = String(firstInfo.reviewId);
-  await host.command("review-done");
+  await host.command("parley", "done");
   const { filename, snapshot } = await currentArtifact(host);
   const finishId = snapshot.requests[0].record.id;
   const savedEvidence = await fs.readFile(filename);
 
   startingFresh = true;
-  const startup = host.command("review");
+  const startup = host.command("parley", "review");
   try {
     await started.promise;
     await assert.rejects(editor.request("review-info"), /initialization is active/);
@@ -354,13 +356,13 @@ test("a fresh /review retains exact old completion reads while its new identity 
   }
 });
 
-test("a session change during /review initialization withdraws the offer without publishing evidence", async t => {
+test("a session change during /parley review initialization withdraws the offer without publishing evidence", async t => {
   const started = Promise.withResolvers<void>();
   const commit = Promise.withResolvers<typeof commitResult>();
   const host = await createParentHost(t, {
     exec: async () => { started.resolve(); return commit.promise; },
   });
-  const startup = host.command("review");
+  const startup = host.command("parley", "review");
   await started.promise;
   const withdrawn = assert.rejects(host.event("session_start"), /Review is busy; preparation was not queued/);
   commit.resolve(commitResult);
@@ -370,9 +372,9 @@ test("a session change during /review initialization withdraws the offer without
 });
 
 for (const kind of ["ask", "investigate"] as const) {
-  test(`/review and editor ${kind} work without a parent handoff`, async t => {
+  test(`/parley review and editor ${kind} work without a parent handoff`, async t => {
     const host = await createParentHost(t);
-    await host.command("review");
+    await host.command("parley", "review");
     const before = await currentArtifact(host);
     const editor = await attachEditor(t, host);
     const info = await editor.request("review-info");
@@ -427,7 +429,7 @@ for (const kind of ["ask", "investigate"] as const) {
       assert.equal(accepted.preparationId, info.preparationId);
       await promptStarted.promise;
       await assert.rejects(host.tool("parley_prepare", handoff), /busy/);
-      await host.command("review-done");
+      await host.command("parley", "done");
       assert.match(String(host.notices.at(-1)), /active or settling/);
     } finally {
       releasePrompt.resolve();
@@ -463,14 +465,14 @@ for (const kind of ["ask", "investigate"] as const) {
   });
 }
 
-test("/review fails early without a persistent transcript or selected model", async t => {
+test("/parley review fails early without a persistent transcript or selected model", async t => {
   for (const missing of ["model", "transcript"] as const) {
     await t.test(missing, async t => {
       const host = await createParentHost(t, {
         getModel: () => missing === "model" ? undefined : model,
         getSessionFile: () => missing === "transcript" ? undefined : path.join(host.state, "parent.jsonl"),
       });
-      await host.command("review");
+      await host.command("parley", "review");
       assert.match(String(host.notices.at(-1)), /persistent parent transcript.*explicitly selected model/);
       assert.deepEqual(await fs.readdir(host.state), ["endpoints"]);
       assert.deepEqual(await fs.readdir(path.join(host.state, "endpoints")), []);
@@ -479,18 +481,18 @@ test("/review fails early without a persistent transcript or selected model", as
   }
 });
 
-test("a fresh /review cannot silently move an existing offer to another workspace", async t => {
+test("a fresh /parley review cannot silently move an existing offer to another workspace", async t => {
   let useOtherWorkspace = false;
   const host = await createParentHost(t, {
     getCwd: root => useOtherWorkspace ? path.join(root, "other") : root,
   });
-  await host.command("review");
-  await host.command("review-done");
+  await host.command("parley", "review");
+  await host.command("parley", "done");
   const { filename, snapshot } = await currentArtifact(host);
   const savedEvidence = await fs.readFile(filename);
   await fs.mkdir(path.join(host.root, "other", ".git"), { recursive: true });
   useOtherWorkspace = true;
-  await host.command("review");
+  await host.command("parley", "review");
   assert.match(String(host.notices.at(-1)), /another workspace\/session; no silent rebinding/);
   assert.deepEqual(await fs.readFile(filename), savedEvidence);
   assert.equal((await currentArtifact(host)).snapshot.header.id, snapshot.header.id);
@@ -502,7 +504,7 @@ test("failed artifact initialization stays failed instead of silently creating a
   await fs.mkdir(host.state, { recursive: true });
   const blockedStorage = path.join(host.state, "reviews");
   await fs.writeFile(blockedStorage, "Existing external data");
-  await host.command("review");
+  await host.command("parley", "review");
   assert.match(String(host.notices.at(-1)), /EEXIST/);
   assert.deepEqual(await fs.readdir(path.join(host.state, "endpoints")), []);
   assert.equal(await fs.readFile(blockedStorage, "utf8"), "Existing external data");
@@ -510,17 +512,17 @@ test("failed artifact initialization stays failed instead of silently creating a
   // Even after the external obstacle disappears, the failed owner is sticky.
   // An explicit command must not silently retry uncertain artifact creation.
   await fs.unlink(blockedStorage);
-  await host.command("review");
+  await host.command("parley", "review");
   assert.match(String(host.notices.at(-1)), /EEXIST/);
   await assert.rejects(fs.access(blockedStorage), { code: "ENOENT" });
   assert.deepEqual(await fs.readdir(path.join(host.state, "endpoints")), []);
   assert.equal(sdk.creations, 0);
 });
 
-test("optional handoff cannot silently change the model/thinking frozen by /review", async t => {
+test("optional handoff cannot silently change the model/thinking frozen by /parley review", async t => {
   let thinking: "off" | "high" = "off";
   const host = await createParentHost(t, { getThinkingLevel: () => thinking });
-  await host.command("review");
+  await host.command("parley", "review");
   const { filename } = await currentArtifact(host);
   const evidence = await fs.readFile(filename);
   thinking = "high";
@@ -537,9 +539,9 @@ test("shutdown withdraws the offer and closes retained reviews even if the paren
       return "parent-entry";
     },
   });
-  await host.command("review");
+  await host.command("parley", "review");
   await host.tool("parley_prepare", handoff);
-  await host.command("review-done");
+  await host.command("parley", "done");
   await host.tool("parley_prepare", handoff);
   assert.equal((await fs.readdir(path.join(host.state, "reviews"))).length, 2);
   boundaryError = new Error("Parent boundary unavailable");
@@ -549,12 +551,12 @@ test("shutdown withdraws the offer and closes retained reviews even if the paren
   await host.event("session_shutdown"); // Cleanup remains idempotent after failure.
 });
 
-test("/review-stop withdraws idle offers and pairing without wrap-up, then permits a fresh exact review", async t => {
+test("/parley stop withdraws idle offers and pairing without wrap-up, then permits a fresh exact review", async t => {
   for (const pairing of ["unpaired", "paired", "disconnected"] as const) {
     await t.test(pairing, async t => {
       let captures = 0;
       const host = await createParentHost(t, { exec: async () => { captures++; return commitResult; } });
-      await host.command("review");
+      await host.command("parley", "review");
       const before = await currentArtifact(host);
       const reviewId = before.snapshot.header.id;
       const editor = pairing === "unpaired" ? undefined : await attachEditor(t, host);
@@ -563,10 +565,10 @@ test("/review-stop withdraws idle offers and pairing without wrap-up, then permi
         editor?.disconnect();
         await disconnected;
       }
-      await host.command("review-stop", "stale-review");
+      await host.command("parley", "stop " + "stale-review");
       assert.match(String(host.notices.at(-1)), /No matching active review/);
       assert.deepEqual((await readReviewArtifact(before.filename)).records, before.snapshot.records);
-      await host.command("review-stop", reviewId);
+      await host.command("parley", "stop " + reviewId);
       await disconnected;
       assert.match(String(host.notices.at(-1)), /stopped without wrap-up/);
       assert.equal(host.statuses.get("parley-bridge"), undefined);
@@ -580,13 +582,13 @@ test("/review-stop withdraws idle offers and pairing without wrap-up, then permi
       assert.equal(sdk.creations, 0);
       assert.deepEqual(host.messages, [], "Stop sends no completion summary or parent turn");
       const evidence = await fs.readFile(before.filename);
-      await host.command("review-stop");
+      await host.command("parley", "stop");
       assert.match(String(host.notices.at(-1)), /No active review/);
-      await host.command("review");
+      await host.command("parley", "review");
       const freshEditor = await attachEditor(t, host);
       const fresh = await freshEditor.request("review-info");
       assert.notEqual(fresh.reviewId, reviewId);
-      await host.command("review-stop", reviewId);
+      await host.command("parley", "stop " + reviewId);
       assert.match(String(host.notices.at(-1)), /No matching active review/);
       await assert.rejects(freshEditor.request("review-result-begin", { requestId: "old-request" }, reviewId), /No matching initialized review/);
       assert.equal((await freshEditor.request("review-info")).reviewId, fresh.reviewId);
@@ -610,7 +612,7 @@ async function stageInvestigation(host: ParentHost, editor: Awaited<ReturnType<t
   return { reviewId, digest };
 }
 
-test("/review-stop cancels actual work and retains the lease until late startup/preflight/execution settles", async t => {
+test("/parley stop cancels actual work and retains the lease until late startup/preflight/execution settles", async t => {
   for (const phase of ["startup", "preflight", "working", "cleanup-failure"] as const) {
     await t.test(phase, async t => {
       const host = await createParentHost(t);
@@ -624,7 +626,7 @@ test("/review-stop cancels actual work and retains the lease until late startup/
         prompts++;
         if (phase === "working" || phase === "cleanup-failure") await hold();
       };
-      await host.command("review");
+      await host.command("parley", "review");
       await fs.writeFile(path.join(host.root, "source.ts"), "retain workspace content\n");
       const editor = await attachEditor(t, host);
       const { filename } = await currentArtifact(host);
@@ -637,19 +639,19 @@ test("/review-stop cancels actual work and retains the lease until late startup/
       }
       const before = await readReviewArtifact(filename);
       let settled = false;
-      const stopping = host.command("review-stop").then(() => { settled = true; });
+      const stopping = host.command("parley", "stop").then(() => { settled = true; });
       try {
         await setImmediate();
         assert.equal(settled, false);
         assert.equal((await fs.readdir(path.join(host.state, "endpoints"))).length, 1, "Do not release execution ownership early");
-        await host.command("review-stop");
+        await host.command("parley", "stop");
         assert.match(String(host.notices.at(-1)), /Nothing queued or cancelled/);
-        await host.command("review");
+        await host.command("parley", "review");
         assert.match(String(host.notices.at(-1)), /busy/);
         await host.command("parley");
         assert.match(String(host.notices.at(-1)), /Nothing queued/);
         await assert.rejects(host.tool("parley_prepare", handoff), /unavailable or busy/);
-        await host.command("review-done");
+        await host.command("parley", "done");
         assert.match(String(host.notices.at(-1)), /Nothing queued/);
         if (phase === "working") editor.disconnect();
       } finally {
@@ -671,7 +673,7 @@ test("/review-stop cancels actual work and retains the lease until late startup/
       assert.equal(prompts, phase === "startup" ? 0 : 1, "No summary or replacement reviewer turn");
       if (phase !== "cleanup-failure") assert.equal(sdk.session?.disposed, true);
       const evidence = await fs.readFile(filename);
-      await host.command("review");
+      await host.command("parley", "review");
       const fresh = await attachEditor(t, host);
       assert.notEqual((await fresh.request("review-info")).reviewId, reviewId);
       assert.deepEqual(await fs.readFile(filename), evidence);
@@ -679,13 +681,13 @@ test("/review-stop cancels actual work and retains the lease until late startup/
   }
 });
 
-test("/review-stop discards unaccepted staging without submitting or replaying it", async t => {
+test("/parley stop discards unaccepted staging without submitting or replaying it", async t => {
   const host = await createParentHost(t);
-  await host.command("review");
+  await host.command("parley", "review");
   const editor = await attachEditor(t, host);
   const { filename, snapshot } = await currentArtifact(host);
   await stageInvestigation(host, editor);
-  await host.command("review-stop");
+  await host.command("parley", "stop");
   const stopped = await readReviewArtifact(filename);
   assert.deepEqual(stopped.records.slice(0, snapshot.records.length), snapshot.records);
   assert.equal(stopped.requests.length, 0);
@@ -693,7 +695,7 @@ test("/review-stop discards unaccepted staging without submitting or replaying i
   assert.deepEqual(host.messages, []);
 });
 
-test("/review-stop rejects active preparation and Done without queuing or cancelling them", async t => {
+test("/parley stop rejects active preparation and Done without queuing or cancelling them", async t => {
   const captured = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   let preparing = false;
@@ -701,12 +703,12 @@ test("/review-stop rejects active preparation and Done without queuing or cancel
     if (preparing) { captured.resolve(); await release.promise; }
     return commitResult;
   } });
-  await host.command("review");
+  await host.command("parley", "review");
   preparing = true;
   const preparation = host.tool("parley_prepare", handoff);
   try {
     await captured.promise;
-    await host.command("review-stop");
+    await host.command("parley", "stop");
     assert.match(String(host.notices.at(-1)), /Nothing queued or cancelled/);
   } finally {
     release.resolve();
@@ -726,11 +728,11 @@ test("/review-stop rejects active preparation and Done without queuing or cancel
   const summarizing = Promise.withResolvers<void>();
   const finish = Promise.withResolvers<void>();
   sdk.onPrompt = async () => { summarizing.resolve(); await finish.promise; };
-  const done = host.command("review-done");
+  const done = host.command("parley", "done");
   try {
     await summarizing.promise;
     const before = await fs.readFile(filename);
-    await host.command("review-stop");
+    await host.command("parley", "stop");
     assert.match(String(host.notices.at(-1)), /wrap-up is active.*nothing queued or cancelled/);
     assert.deepEqual(await fs.readFile(filename), before);
     assert.equal(sdk.session?.aborted, false);
@@ -741,12 +743,91 @@ test("/review-stop rejects active preparation and Done without queuing or cancel
   const completed = await readReviewArtifact(filename);
   assert(completed.end);
   const evidence = await fs.readFile(filename);
-  await host.command("review-stop");
+  await host.command("parley", "stop");
   assert.match(String(host.notices.at(-1)), /already completed/);
   assert.deepEqual(await fs.readFile(filename), evidence);
   assert.equal(host.messages.length, 1);
-  await host.command("review-done");
+  await host.command("parley", "done");
   assert.equal(host.messages.length, 2, "Saved completion remains readable without another summary");
+});
+
+test("editor Done delivers the saved recap to its Pi parent, once and independently of editor polling", async t => {
+  for (const mode of ["concurrent-done", "editor-disconnected", "foreign-transcript"] as const) {
+    await t.test(mode, async t => {
+      let transcriptPath = path.join(os.tmpdir(), "parley-original-parent.jsonl");
+      const host = await createParentHost(t, { getSessionFile: () => transcriptPath });
+      await host.command("parley", "review");
+      const editor = await attachEditor(t, host);
+      const { filename } = await currentArtifact(host);
+      const { reviewId, digest } = await stageInvestigation(host, editor);
+      await editor.request("review-batch-commit", { batchId: "batch", digest }, reviewId);
+      let ready = false;
+      for (let attempt = 0; attempt < 1000; attempt++) {
+        const info = await editor.request("review-info");
+        if (!info.busy) {
+          const result = await editor.request("review-result-begin", { requestId: "batch" }, reviewId);
+          assert.equal(result.status, "ready");
+          ready = true;
+          break;
+        }
+        await setTimeout(1);
+      }
+      assert(ready, "Investigation settles before Done");
+      const summarizing = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let wrapUpTurns = 0;
+      let parentDone: Promise<void> | undefined;
+      sdk.onPrompt = async () => { wrapUpTurns++; summarizing.resolve(); await release.promise; };
+      try {
+        // Even a matching session ID must not deliver into another transcript.
+        if (mode === "foreign-transcript") transcriptPath = path.join(os.tmpdir(), "parley-foreign-parent.jsonl");
+        const begun = await editor.request("review-finish-begin", { finishId: "editor-done" }, reviewId);
+        assert.equal(begun.state, "wrapping");
+        await summarizing.promise;
+        const repeated = await editor.request("review-finish-begin", { finishId: "repeat-done" }, reviewId);
+        assert.equal(repeated.finishId, "editor-done");
+        assert.equal(host.messages.length, 0, "No recap before durable completion");
+        if (mode === "concurrent-done") parentDone = host.command("parley", "done");
+        if (mode === "editor-disconnected") editor.disconnect();
+      } finally {
+        release.resolve();
+        await parentDone;
+      }
+      let completed = false;
+      for (let attempt = 0; attempt < 1000; attempt++) {
+        if (mode === "foreign-transcript"
+          ? (await editor.request("review-finish-status", { finishId: "editor-done" }, reviewId)).state === "completed"
+          : host.messages.length === 1) { completed = true; break; }
+        await setTimeout(1);
+      }
+      assert(completed, "Accepted Done finishes without a second Pi command or editor polling");
+      const saved = await readReviewArtifact(filename);
+      assert(saved.end);
+      assert.equal(wrapUpTurns, 1);
+      assert.equal(saved.requests.filter(item => item.record.kind === "wrap-up").length, 1);
+      if (mode === "foreign-transcript") {
+        assert.deepEqual(host.messages, [], "No recap is routed into a foreign parent transcript");
+      } else {
+        assert.equal(host.messages.length, 1, "Concurrent Done observers deliver only one recap");
+        const recap = object(host.messages[0]);
+        assert.equal(recap.customType, "parley-review-done");
+        assert.equal(recap.content, saved.end.summary);
+        assert.deepEqual(recap.details, { reviewId, artifactPath: filename });
+        assert.deepEqual(host.messageOptions, [{ triggerTurn: false }]);
+      }
+      if (mode === "concurrent-done") {
+        const evidence = await fs.readFile(filename);
+        await editor.request("review-finish-begin", { finishId: "reopen-editor" }, reviewId);
+        await setTimeout(1);
+        assert.equal(host.messages.length, 1, "Editor summary reopen does not inject another parent recap");
+        await host.command("parley", "done");
+        assert.equal(host.messages.length, 2, "Explicit Pi Done can redisplay the same saved summary");
+        assert.equal(object(host.messages[1]).content, saved.end.summary);
+        assert.equal(wrapUpTurns, 1);
+        assert.deepEqual(await fs.readFile(filename), evidence);
+      }
+    });
+  }
 });
 
 test("session withdrawal cannot release a stopping review's lease before settlement or route its late notification", async t => {
@@ -754,18 +835,18 @@ test("session withdrawal cannot release a stopping review's lease before settlem
   const started = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   sdk.beforeCreate = async () => { started.resolve(); await release.promise; };
-  await host.command("review");
+  await host.command("parley", "review");
   const editor = await attachEditor(t, host);
   const { filename } = await currentArtifact(host);
   const { reviewId, digest } = await stageInvestigation(host, editor);
   await editor.request("review-batch-commit", { batchId: "batch", digest }, reviewId);
   await started.promise;
-  const stopping = host.command("review-stop");
+  const stopping = host.command("parley", "stop");
   const changed = host.event("session_start");
   try {
     await setImmediate();
     assert.equal((await fs.readdir(path.join(host.state, "endpoints"))).length, 1);
-    await host.command("review");
+    await host.command("parley", "review");
     assert.match(String(host.notices.at(-1)), /busy/);
   } finally {
     release.resolve();
@@ -774,7 +855,7 @@ test("session withdrawal cannot release a stopping review's lease before settlem
   assert(!host.notices.some(notice => notice.includes("stopped without wrap-up")), "No late notification into a replacement session");
   assert.deepEqual(await fs.readdir(path.join(host.state, "endpoints")), []);
   assert.equal((await readReviewArtifact(filename)).requests[0].outcome?.status, "cancelled");
-  await host.command("review");
+  await host.command("parley", "review");
   const fresh = await attachEditor(t, host);
   assert.notEqual((await fresh.request("review-info")).reviewId, reviewId);
   assert.match(String(host.statuses.get("parley-bridge")), /editor paired/);

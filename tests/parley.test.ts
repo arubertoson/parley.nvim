@@ -46,14 +46,12 @@ async function fixture(t: TestContext, options: { busy?: boolean; unsupported?: 
   const original = parent.map(entry => JSON.stringify(entry)).join("\n") + "\n";
   await fs.writeFile(parentFile, original);
   const manager = SessionManager.open(parentFile);
-  const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
   const tools = new Map<string, ToolDefinition>();
   const events = new Map<string, (event: Record<string, unknown>, ctx: ExtensionCommandContext) => unknown>();
   const messages: Record<string, unknown>[] = [], notices: string[] = [];
   const statuses = new Map<string, string | undefined>();
   let unsupported = !!options.unsupported;
   const api = {
-    registerCommand: (name: string, command: Parameters<ExtensionAPI["registerCommand"]>[1]) => commands.set(name, command),
     registerTool: (tool: ToolDefinition) => tools.set(tool.name, tool),
     on: (name: string, handler: (event: Record<string, unknown>, ctx: ExtensionCommandContext) => unknown) => events.set(name, handler),
     getThinkingLevel: () => "off", getActiveTools: () => ["write", "parley_interact", ...(unsupported ? ["model_only"] : [])],
@@ -71,11 +69,8 @@ async function fixture(t: TestContext, options: { busy?: boolean; unsupported?: 
   const host = {
     root, state, ctx, messages, notices, statuses, coordinator,
     activateModelOnly() { unsupported = true; },
-    async command(name: string, args = "") {
-      const command = commands.get(name);
-      assert(command, `Command ${name} is registered`);
-      await command.handler(args, ctx);
-    },
+    startImplementation() { return coordinator.start("", ctx); },
+    stopImplementation(args = "") { return coordinator.stop(args, ctx); },
     async event(name: string, event: Record<string, unknown> = {}) { return events.get(name)?.(event, ctx); },
     start() {
       const message = messages.at(-1)!;
@@ -174,7 +169,7 @@ async function attach(t: TestContext, host: Awaited<ReturnType<typeof fixture>>)
 
 test("/parley without submissions starts no child and durably returns to the exact parent", async t => {
   const host = await fixture(t);
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.messages.length, 1);
   assert.equal(host.messages[0].display, false);
   assert.equal(sdk.creations, 0);
@@ -199,19 +194,18 @@ test("/parley without submissions starts no child and durably returns to the exa
   await host.parentUnchanged();
 });
 
-test("/parley-stop is the only stop command and permits a fresh interaction after withdrawal without recap", async t => {
+test("implementation withdrawal permits a fresh interaction without recap", async t => {
   const host = await fixture(t);
-  await host.command("parley");
+  await host.startImplementation();
   const running = host.start();
   await attach(t, host);
   const before = await host.artifact();
   const pathBefore = path.join(host.state, "parleys", `${before.header.id}.jsonl`);
-  await assert.rejects(host.command("parley-cancel"), /Command parley-cancel is registered/);
-  assert.equal(host.coordinator.active(), true, "The removed alias must not stop the interaction");
+  assert.equal(host.coordinator.active(), true);
   assert.equal(await fs.readFile(path.join(host.root, "source.ts"), "utf8"), "source\n");
   // A hosted interaction makes the real parent busy; stop must not require idle.
   host.ctx.isIdle = () => false;
-  await host.command("parley-stop");
+  await host.stopImplementation();
   assert.equal(host.coordinator.active(), false, "Command acknowledgment follows cleanup");
   assert.deepEqual(await fs.readdir(path.join(host.state, "endpoints")), []);
   assert.equal(host.statuses.get("parley-implementation"), undefined);
@@ -228,38 +222,38 @@ test("/parley-stop is the only stop command and permits a fresh interaction afte
   assert.equal(host.messages.length, 1, "Stop sends no extra parent message");
   assert.match(String(host.notices.at(-1)), /stopped without wrap-up/);
   const saved = await fs.readFile(pathBefore);
-  await host.command("parley-stop");
+  await host.stopImplementation();
   assert.match(String(host.notices.at(-1)), /No active Parley/);
   host.ctx.isIdle = () => true;
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.coordinator.active(), true);
   assert.notEqual(object(host.messages[0].details).interactionId, object(host.messages[1].details).interactionId);
   assert.deepEqual(await fs.readFile(pathBefore), saved);
   await host.parentUnchanged();
 });
 
-test("/parley-stop rejects foreign parents, arguments and initialization without queuing withdrawal", async t => {
+test("/parley stop rejects foreign parents, arguments and initialization without queuing withdrawal", async t => {
   const captured = Promise.withResolvers<void>();
   const release = Promise.withResolvers<string>();
   t.after(() => release.resolve("a".repeat(40)));
   const host = await fixture(t, { captureCommit: async () => { captured.resolve(); return release.promise; } });
-  await host.command("parley");
-  await host.command("parley-stop");
+  await host.startImplementation();
+  await host.stopImplementation();
   assert.match(String(host.notices.at(-1)), /not initialization/);
   assert.equal(host.coordinator.active(), true);
   const running = host.start();
   await captured.promise;
-  await host.command("parley-stop");
+  await host.stopImplementation();
   assert.match(String(host.notices.at(-1)), /not initialization/);
   release.resolve("a".repeat(40));
   const editor = await attach(t, host);
   const before = await host.artifact();
-  await host.command("parley-stop", "a reason is not accepted");
+  await host.stopImplementation("a reason is not accepted");
   assert.match(String(host.notices.at(-1)), /without arguments/);
   const getSessionId = host.ctx.sessionManager.getSessionId.bind(host.ctx.sessionManager);
   host.ctx.sessionManager.getSessionId = () => "another-parent";
   try {
-    await host.command("parley-stop");
+    await host.stopImplementation();
     assert.match(String(host.notices.at(-1)), /requires the originating Pi session/);
   } finally {
     host.ctx.sessionManager.getSessionId = getSessionId;
@@ -268,18 +262,18 @@ test("/parley-stop rejects foreign parents, arguments and initialization without
   assert.equal((await editor.status()).ended, false);
   const entered = await host.event("input", { source: "interactive" });
   assert.equal(object(entered).action, "handled");
-  assert.match(String(host.notices.at(-1)), /\/parley-stop here/);
-  await host.command("parley-stop");
+  assert.match(String(host.notices.at(-1)), /\/parley stop here/);
+  await host.stopImplementation();
   assert.equal((await running).isError, true);
 });
 
-test("/parley-stop does not cancel or relabel an accepted Done", async t => {
+test("/parley stop does not cancel or relabel an accepted Done", async t => {
   const host = await fixture(t);
-  await host.command("parley");
+  await host.startImplementation();
   const running = host.start();
   const editor = await attach(t, host);
   await editor.send("review-finish-begin", { finishId: "finish" });
-  await host.command("parley-stop");
+  await host.stopImplementation();
   assert.match(String(host.notices.at(-1)), /wrap-up is active|already completed|No active Parley/);
   const completion = await until(async () => {
     const result = await editor.send("review-finish-status", { finishId: "finish" });
@@ -296,7 +290,7 @@ test("fork capture compares persisted JSON without treating optional undefined f
   const host = await fixture(t);
   const branch = host.ctx.sessionManager.getBranch.bind(host.ctx.sessionManager);
   host.ctx.sessionManager.getBranch = leaf => branch(leaf).map(entry => ({ ...entry, details: undefined }));
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.messages.length, 1);
   assert.equal(sdk.creations, 0);
   await host.parentUnchanged();
@@ -306,7 +300,7 @@ test("fork capture rejects genuinely unpersisted parent context", async t => {
   const host = await fixture(t);
   const branch = host.ctx.sessionManager.getBranch.bind(host.ctx.sessionManager);
   host.ctx.sessionManager.getBranch = leaf => branch(leaf).filter(entry => entry.id !== "user");
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.messages.length, 0);
   assert(host.notices.some(message => message.includes("has not persisted")));
   assert.equal(sdk.creations, 0);
@@ -315,12 +309,12 @@ test("fork capture rejects genuinely unpersisted parent context", async t => {
 
 test("an open review rejects /parley without starting another owner", async t => {
   const host = await fixture(t, { busy: true });
-  await host.command("parley"); assert.equal(host.messages.length, 0);
+  await host.startImplementation(); assert.equal(host.messages.length, 0);
 });
 
 test("active model-only tools no longer reject normal child setup", async t => {
   const host = await fixture(t, { unsupported: true });
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.messages.length, 1);
   assert.equal(host.coordinator.active(), true);
   assert.equal(sdk.creations, 0);
@@ -329,12 +323,12 @@ test("active model-only tools no longer reject normal child setup", async t => {
 
 test("parent capability changes do not gate the normal child at the host boundary", async t => {
   const host = await fixture(t);
-  await host.command("parley");
+  await host.startImplementation();
   assert.equal(host.messages.length, 1);
   host.activateModelOnly();
   const running = host.start();
   await attach(t, host);
-  await host.command("parley-stop");
+  await host.stopImplementation();
   const stopped = await running;
   assert.equal(stopped.isError, true);
   assert(stopped.content[0]?.type === "text" && stopped.content[0].text.includes("cancelled"));

@@ -36,6 +36,7 @@ local api = vim.api
 ---@field closed? fun(restore: boolean, destination?: 'source') After teardown; restore is true only for an explicit, focused exit.
 ---@field draft_label? string Optional editing label; no thread/workflow state is owned here.
 ---@field managed? boolean Borrower owns geometry; measure/place never call back into its layout.
+---@field thread_action? fun(action: 'resolve'|'reopen'|'delete') Host-owned active-thread action.
 
 ---@class ParleyComposer.Mapping
 ---@field name string Composer action; aliases share one footer hint.
@@ -398,6 +399,7 @@ local function geometry(editor, reveal)
     local indent, width, padding = style.layout(editor.source_win)
     local heading = {
         style.heading(editor.note, editor.options.draft_label or "editing", first, last, width),
+        "",
     }
     local below = last < api.nvim_buf_line_count(editor.source_buf) and 1 or 0
     local available = window_height - #heading - 3 - below
@@ -705,6 +707,14 @@ local function install_bindings(editor)
             M.close(true)
             editor.options.navigate(direction.step)
         end, direction.step == 1 and "next note" or "previous note")
+    end
+
+    if editor.options.thread_action then
+        for _, name in ipairs({ "resolve", "reopen", "delete" }) do
+            bind(name, { "n" }, function()
+                editor.options.thread_action(name)
+            end, name .. " thread")
+        end
     end
 
     bind("help", { "n" }, M.toggle_help, "hotkeys")

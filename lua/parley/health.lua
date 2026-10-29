@@ -57,7 +57,9 @@ end
 ---@param snapshot ParleyBridge.Status?
 local function report_bridge(snapshot)
     if not snapshot then
-        vim.health.info("No review pairing requested; run /review in Pi, then :ReviewStart here")
+        vim.health.info(
+            "No review pairing requested; run /parley review in Pi, then :Parley start review here"
+        )
         return
     end
     vim.health.info("Editor identity: " .. snapshot.editor_id)
@@ -68,7 +70,9 @@ local function report_bridge(snapshot)
     if snapshot.error then
         vim.health.warn(snapshot.error)
     elseif not snapshot.connected and snapshot.state ~= "idle" then
-        vim.health.warn("Review is not connected; run /review in Pi, then :ReviewStart here")
+        vim.health.warn(
+            "Review is not connected; run /parley review in Pi, then :Parley start review here"
+        )
     end
     if snapshot.binding then
         vim.health.info("Bound workspace: " .. snapshot.binding.workspace)

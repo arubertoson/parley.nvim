@@ -96,6 +96,31 @@ T["Ask captures all conversations; acceptance and replies preserve later edits a
     ]])
 end
 
+T["selected history previews expand beyond the compact source-card limit"] = function()
+    child.lua([[
+        vim.o.lines = 40
+        local data = assert(workspace.add_conversation({ id = 'expanded', lines = { 'Question' } }, 1, 1))
+        local request = capture('expand-history', 'ask')
+        accept(request)
+        local lines = {}
+        for index = 1, 12 do lines[index] = 'Response line ' .. index end
+        assert(conversation.receive_batch(data, {{
+            id = 'long-answer', parent_id = data.thread.messages[1].id, version = 2,
+            role = 'agent', author = 'Agent', origin = 'review', created_at = 1, lines = lines,
+        }}, 1, data.thread.messages[1].id))
+        workspace.move_note(1)
+        local rendered = {}
+        for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(source_buf, -1, 0, -1, { details = true })) do
+            for _, line in ipairs(mark[4].virt_lines or {}) do
+                for _, chunk in ipairs(line) do rendered[#rendered + 1] = chunk[1] end
+            end
+        end
+        local text = table.concat(rendered, '\n')
+        assert(text:find('Response line 12', 1, true), text)
+        assert(vim.api.nvim_get_current_win() == source_win and #vim.api.nvim_list_wins() == 1)
+    ]])
+end
+
 T["Investigate needs no comments and retains unloaded findings without opening their files"] = function()
     child.lua([[
         empty = capture('investigate-empty', 'investigate')
@@ -305,8 +330,9 @@ T["local save, close and workspace detach retain the same draft buffer and nativ
     child.lua([[
         accept(capture('draft-history', 'ask'))
         workspace.edit_note()
-        assert(vim.api.nvim_get_current_buf() == draft_buf)
     ]])
+    child.type_keys("e") -- Submitted text opens as history; editing explicitly resumes its buffer.
+    child.lua("assert(vim.api.nvim_get_current_buf() == draft_buf)")
     child.type_keys("<CR>")
     child.lua([[
         assert(vim.api.nvim_get_current_win() ~= source_win)
@@ -330,10 +356,10 @@ T["local save, close and workspace detach retain the same draft buffer and nativ
         assert(vim.api.nvim_get_current_win() ~= source_win)
         assert(vim.api.nvim_get_current_buf() ~= draft_buf)
         assert(vim.api.nvim_get_current_line() == 'Answer')
-        assert(vim.api.nvim_win_get_cursor(0)[1] == 2)
+        assert(vim.api.nvim_win_get_cursor(0)[1] == 3)
     ]])
     child.type_keys("gg")
-    MiniTest.expect.equality(child.lua_get("vim.api.nvim_win_get_cursor(0)[1]"), 2)
+    MiniTest.expect.equality(child.lua_get("vim.api.nvim_win_get_cursor(0)[1]"), 3)
     child.type_keys("q")
     child.lua([[
         assert(vim.api.nvim_get_current_win() == source_win)
@@ -371,7 +397,7 @@ T["Done displays a read-only summary without submitting drafts; a fresh review c
             vim.schedule(function() callback(response) end)
         end
         vim.cmd.runtime('plugin/parley.lua')
-        vim.cmd.ReviewDone()
+        vim.cmd('Parley done')
         assert(vim.wait(2000, function() return require('parley').request_status().phase == 'review-completed' end))
         assert(begins == 1 and polls == 1)
         assert(vim.wait(1000, function() return vim.b.parley_summary == 'first-review' end))
@@ -388,7 +414,7 @@ T["Done displays a read-only summary without submitting drafts; a fresh review c
     child.lua([[
         assert(vim.api.nvim_get_current_win() == source_win)
         assert(not workspace.select_review('second-review'))
-        workspace.allow_review_selection() -- Explicit ReviewStart boundary.
+        workspace.allow_review_selection() -- Explicit :Parley start boundary.
         assert(workspace.select_review('second-review'))
         assert(workspace.review_id() == 'second-review')
         assert(#capture('new-investigation', 'investigate').conversations == 0)
@@ -422,6 +448,11 @@ T["Parley turns capture workspace-wide unresolved prose and preserve resolved dr
         assert(#first.thread.messages == 1 and #resolved.thread.messages == 0)
         assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), text))
         assert(vim.deep_equal(vim.api.nvim_buf_call(buffer, vim.fn.undotree), undo))
+        -- Reopening requires an active thread, not the remembered selection
+        -- while this unrelated empty buffer has focus.
+        vim.cmd.buffer(source_buf)
+        vim.api.nvim_win_set_cursor(source_win, { 2, 0 })
+        workspace.edit_note()
         workspace.resolve_note(false)
         local reopened = capture('reopened-turn', 'ask')
         assert(#reopened.messages == 1 and reopened.messages[1].conversationId == 'resolved')
@@ -460,6 +491,441 @@ T["Parley capture rejects unsaved workspace sources without committing prose"] =
         assert(vim.api.nvim_buf_get_lines(draft.note.buffer, 0, -1, false)[1] == 'Localized request')
         vim.cmd.write()
         assert(#capture('saved', 'ask').messages == 1)
+    ]])
+end
+
+for _, workflow in ipairs({ "review", "parley" }) do
+    T[workflow .. ": resolve and reopen require an active selection and filter submissions"] = function()
+        child.lua(
+            [[
+            local workflow = ...
+            assert(workspace.select_review('thread-actions', workflow))
+            parley = require('parley')
+            vim.cmd.runtime('plugin/parley.lua')
+            notices = {}
+            vim.notify = function(message) notices[#notices + 1] = message end
+            a = assert(workspace.add_conversation({ id = 'a', lines = { 'Keep A' } }, 1, 1))
+            b = assert(workspace.add_conversation({ id = 'b', lines = { 'Keep B' } }, 2, 2))
+            vim.ui.select = function() error('No active selection must not open confirmation') end
+            parley.resolve_note(true)
+            parley.delete_note()
+            assert(#notices == 2 and notices[1]:find('select a thread', 1, true))
+            assert(not a.resolved and not b.resolved and not a.deleted)
+            workspace.edit_note()
+            assert(conversation.active() == a)
+            before = { text = vim.api.nvim_buf_get_lines(a.note.buffer, 0, -1, false),
+                undo = vim.api.nvim_buf_call(a.note.buffer, vim.fn.undotree), history = vim.deepcopy(a.thread) }
+            vim.cmd('Parley thread resolve')
+            assert(a.resolved and not b.resolved)
+            local request = capture('only-b', 'ask')
+            assert(#request.messages == 1 and request.messages[1].conversationId == 'b')
+            assert(vim.deep_equal(a.thread, before.history))
+            assert(vim.deep_equal(vim.api.nvim_buf_call(a.note.buffer, vim.fn.undotree), before.undo))
+        ]],
+            { workflow }
+        )
+        child.type_keys("<C-c>")
+        child.lua([[
+            -- Moving away from A must not use its remembered selection.
+            vim.api.nvim_win_set_cursor(source_win, { 3, 0 })
+            assert(not conversation.active())
+            parley.resolve_note(false)
+            parley.delete_note()
+            assert(a.resolved and not a.deleted)
+            assert(notices[#notices]:find('select a thread', 1, true))
+            -- B at the cursor is not selected merely because A was selected.
+            vim.api.nvim_win_set_cursor(source_win, { 2, 0 })
+            assert(not conversation.active())
+            parley.resolve_note(true)
+            assert(not b.resolved)
+            vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
+            workspace.edit_note()
+            assert(conversation.active() == a)
+            vim.cmd('Parley thread reopen')
+            local reopened = capture('reopened', 'ask')
+            assert(#reopened.messages == 2 and not a.resolved)
+            assert(a.note.buffer == vim.api.nvim_get_current_buf())
+            assert(vim.deep_equal(vim.api.nvim_buf_get_lines(a.note.buffer, 0, -1, false), before.text))
+            -- Leaving Insert mode synchronizes an undo block without changing
+            -- its entries. Check retained history, not that transient flag.
+            local after_undo = vim.api.nvim_buf_call(a.note.buffer, vim.fn.undotree)
+            after_undo.synced = before.undo.synced
+            assert(vim.deep_equal(after_undo, before.undo))
+            assert(vim.deep_equal(a.thread, before.history))
+        ]])
+        child.type_keys("<C-c>")
+        child.lua([[
+            -- Neither another source window nor an unrelated buffer can borrow A.
+            vim.cmd.vsplit(root .. '/other.lua')
+            assert(not conversation.active())
+            parley.resolve_note(true)
+            assert(not a.resolved)
+        ]])
+    end
+
+    T[workflow .. ": confirmed deletion hides threads but retains text, history, undo and anchors"] = function()
+        child.lua(
+            [[
+            local workflow = ...
+            assert(workspace.select_review('delete-thread', workflow))
+            vim.cmd.runtime('plugin/parley.lua')
+            a = assert(workspace.add_conversation({ id = 'deleted-a', lines = { 'Retained A' }, messages = {
+                { id = 'human-a', role = 'human', author = 'Human', origin = 'editor', created_at = 1, lines = { 'Original A' } },
+                { id = 'agent-a', parent_id = 'human-a', role = 'agent', author = 'Agent', origin = 'pi', created_at = 2, lines = { 'Answer A' } },
+            } }, 1, 1))
+            b = assert(workspace.add_conversation({ id = 'kept-b', lines = { 'Retained B' } }, 2, 2))
+            workspace.edit_note()
+            reader_win = vim.api.nvim_get_current_win()
+            assert(conversation.active() == a)
+        ]],
+            { workflow }
+        )
+        child.type_keys("r")
+        child.lua([[
+            reply_buffer = vim.api.nvim_get_current_buf()
+            vim.api.nvim_buf_set_lines(reply_buffer, 0, -1, false, { 'Unsubmitted reply A' })
+        ]])
+        child.type_keys("<Esc>", "<C-c>", "q")
+        child.lua([[
+            assert(vim.api.nvim_get_current_win() == source_win)
+            workspace.edit_note()
+        ]])
+        child.type_keys("<Esc>")
+        child.lua(
+            [[
+            local workflow = ...
+            -- Snapshot every retained draft, not only the initial or visible one.
+            retained = {}
+            for _, draft in ipairs(a.drafts) do
+                retained[#retained + 1] = { buffer = draft.buffer,
+                    text = vim.api.nvim_buf_get_lines(draft.buffer, 0, -1, false),
+                    undo = vim.api.nvim_buf_call(draft.buffer, vim.fn.undotree) }
+            end
+            assert(#retained >= 2)
+            history = vim.deepcopy(a.thread)
+            anchors_before = vim.api.nvim_buf_get_extmarks(source_buf, -1, 0, -1, { details = true })
+            anchor_count = 0
+            for _, mark in ipairs(anchors_before) do
+                if not mark[4].virt_lines then anchor_count = anchor_count + 1 end
+            end
+            confirmations = 0
+            vim.ui.select = function(items, options, callback)
+                confirmations = confirmations + 1
+                assert(items[1] == 'Cancel' and options.prompt:find('deleted-a', 1, true))
+                confirmation = callback
+            end
+            vim.cmd('Parley thread delete')
+            confirmation('Cancel')
+            assert(not a.deleted and conversation.active() == a)
+            assert(#capture('not-deleted', 'ask').messages == 2)
+            vim.cmd('Parley thread delete')
+            confirmation('Delete')
+            assert(confirmations == 2 and a.deleted and not b.deleted)
+            assert(vim.api.nvim_get_current_win() == source_win)
+            assert(not conversation.active())
+            assert(vim.deep_equal(a.thread, history))
+            for _, saved in ipairs(retained) do
+                assert(vim.api.nvim_buf_is_loaded(saved.buffer))
+                assert(vim.deep_equal(vim.api.nvim_buf_get_lines(saved.buffer, 0, -1, false), saved.text))
+                assert(vim.deep_equal(vim.api.nvim_buf_call(saved.buffer, vim.fn.undotree), saved.undo))
+            end
+            local current_anchors, rendered = 0, {}
+            for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(source_buf, -1, 0, -1, { details = true })) do
+                if not mark[4].virt_lines then current_anchors = current_anchors + 1 end
+                for _, line in ipairs(mark[4].virt_lines or {}) do
+                    for _, chunk in ipairs(line) do rendered[#rendered + 1] = chunk[1] end
+                end
+            end
+            assert(current_anchors == anchor_count, 'Source anchors remain available for inspection')
+            local text = table.concat(rendered, '\n')
+            assert(not text:find('Answer A', 1, true) and not text:find('Unsubmitted reply A', 1, true))
+            assert(require('parley').status():find('1 notes', 1, true))
+            local request = capture('after-delete', 'ask')
+            assert(#request.messages == 1 and request.messages[1].conversationId == 'kept-b')
+            assert(not conversation.capture(a, 'Human', 'editor'))
+            workspace.move_note(1)
+            assert(conversation.active() == b)
+            workspace.move_note(1)
+            assert(conversation.active() == b, 'Navigation must skip deleted threads')
+            workspace.stop()
+            assert(workspace.activate(binding))
+            workspace.allow_review_selection()
+            assert(workspace.select_review('delete-thread', workflow))
+            assert(#capture('after-reattach', 'ask').messages == 1)
+            vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
+            workspace.edit_note()
+            assert(not conversation.active(), 'Reattachment must not display a deleted thread')
+        ]],
+            { workflow }
+        )
+    end
+end
+
+T["delete confirmation rechecks selection, request activity and workspace identity"] = function()
+    child.lua([[
+        notices = {}
+        vim.notify = function(message) notices[#notices + 1] = message end
+        assert(workspace.select_review('confirm-owner'))
+        a = assert(workspace.add_conversation({ id = 'a', lines = { 'A' } }, 1, 1))
+        workspace.edit_note()
+        vim.ui.select = function(_, _, callback) confirmation = callback end
+        workspace.delete_note()
+    ]])
+    child.type_keys("<C-c>")
+    child.lua([[
+        vim.api.nvim_win_set_cursor(source_win, { 3, 0 })
+        confirmation('Delete')
+        assert(not a.deleted and notices[#notices]:find('selection changed', 1, true))
+        vim.api.nvim_win_set_cursor(source_win, { 1, 0 })
+        workspace.edit_note()
+        workspace.delete_note()
+        request = capture('raced-request', 'ask')
+        workspace.request_activity(request, 'uploading')
+        confirmation('Delete')
+        assert(not a.deleted and notices[#notices]:find('awaiting a response', 1, true))
+        workspace.request_activity(request, nil)
+        workspace.delete_note()
+        workspace.stop()
+        assert(workspace.activate(binding))
+        confirmation('Delete')
+        assert(not a.deleted and notices[#notices]:find('selection changed', 1, true))
+    ]])
+end
+
+T["deleted threads reject stale acceptance and late replies without resurrection"] = function()
+    child.lua([[
+        a = assert(workspace.add_conversation({ id = 'a', lines = { 'A' } }, 1, 1))
+        b = assert(workspace.add_conversation({ id = 'b', lines = { 'B' } }, 2, 2))
+        request = capture('stale-capture', 'ask')
+        workspace.edit_note()
+        vim.ui.select = function(_, _, callback) callback('Delete') end
+        workspace.delete_note()
+        local record = vim.tbl_extend('force', request.request, { type = 'request' })
+        assert(not workspace.accept_request(request, record))
+        assert(#a.thread.messages == 0 and #b.thread.messages == 0, 'Acceptance remains atomic')
+        workspace.request_activity(request, nil)
+        local message = { id = 'late', role = 'agent', author = 'Agent', origin = 'pi', created_at = 2, lines = { 'Late reply' } }
+        assert(not conversation.receive(a, message))
+        assert(not conversation.receive_batch(a, { message }, 0, nil))
+        assert(a.deleted and #a.thread.messages == 0)
+        workspace.move_note(1)
+        assert(conversation.active() == b)
+    ]])
+end
+
+T["custom thread bindings work in source and initial composer and restore prior mappings"] = function()
+    child.lua([[
+        workspace.stop()
+        parley = require('parley')
+        parley.setup({ keymaps = {
+            review = { resolve = '<F6>', reopen = '<F7>', delete = '<F8>' },
+            composer = { resolve = '<F6>', reopen = '<F7>', delete = '<F8>' },
+        } })
+        original = function() end
+        vim.keymap.set('n', '<F6>', original, { buffer = source_buf })
+        assert(workspace.activate(binding))
+        a = assert(workspace.add_conversation({ id = 'mapped', lines = { 'Mapped thread' } }, 1, 1))
+        workspace.edit_note()
+    ]])
+    child.type_keys("<Esc>", "<F6>")
+    child.lua("assert(a.resolved and conversation.active() == a)")
+    child.type_keys("<F7>")
+    child.lua("assert(not a.resolved)")
+    child.type_keys("<C-c>", "<F6>")
+    child.lua("assert(a.resolved and vim.api.nvim_get_current_win() == source_win)")
+    child.type_keys("<F7>")
+    child.lua([[
+        assert(not a.resolved)
+        vim.ui.select = function(_, _, callback) callback('Delete') end
+        workspace.edit_note()
+    ]])
+    child.type_keys("<Esc>", "<F8>")
+    child.lua([[
+        assert(a.deleted and vim.api.nvim_get_current_win() == source_win)
+        assert(vim.fn.maparg('<F6>', 'n', false, true).callback ~= original)
+        assert(vim.api.nvim_buf_call(a.note.buffer, function() return vim.fn.maparg('<F6>', 'n', false, true).buffer end) ~= 1)
+        workspace.stop()
+        assert(vim.fn.maparg('<F6>', 'n', false, true).callback == original)
+    ]])
+end
+
+T["reader, parent reader and reply composer bindings act on the complete active thread"] = function()
+    child.lua([[
+        workspace.stop()
+        require('parley').setup({ keymaps = {
+            discussion = { resolve = '<F6>', reopen = '<F7>', delete = '<F8>' },
+            composer = { resolve = '<F6>', reopen = '<F7>', delete = '<F8>' },
+        } })
+        assert(workspace.activate(binding))
+        a = assert(workspace.add_conversation({ id = 'reader', lines = { 'Retained draft' }, messages = {
+            { id = 'human', role = 'human', author = 'Human', origin = 'editor', created_at = 1, lines = { 'Question' } },
+            { id = 'agent', parent_id = 'human', role = 'agent', author = 'Agent', origin = 'pi', created_at = 2, lines = { 'Answer' } },
+        } }, 1, 1))
+        workspace.edit_note()
+        reader_win = vim.api.nvim_get_current_win()
+        assert(conversation.active() == a)
+    ]])
+    child.type_keys("<F6>")
+    child.lua([[
+        assert(a.resolved and vim.api.nvim_get_current_win() == reader_win)
+        for _, window in ipairs(vim.api.nvim_list_wins()) do
+            if window ~= source_win and window ~= reader_win then parent_win = window end
+        end
+        vim.api.nvim_set_current_win(assert(parent_win))
+        assert(conversation.active() == a)
+    ]])
+    child.type_keys("<F7>")
+    child.lua([[
+        assert(not a.resolved and vim.api.nvim_get_current_win() == parent_win)
+        vim.api.nvim_set_current_win(reader_win)
+    ]])
+    child.type_keys("r", "<Esc>", "<F6>")
+    child.lua([[
+        assert(a.resolved and conversation.active() == a)
+        reply_buf = vim.api.nvim_get_current_buf()
+        assert(reply_buf ~= a.note.buffer)
+    ]])
+    child.type_keys("<F7>")
+    child.lua([[
+        assert(not a.resolved)
+        vim.ui.select = function(_, _, callback) callback('Delete') end
+    ]])
+    child.type_keys("<F8>")
+    child.lua([[
+        assert(a.deleted and #a.thread.messages == 2)
+        assert(vim.api.nvim_buf_is_loaded(reply_buf))
+        assert(vim.api.nvim_get_current_win() == source_win)
+        assert(not vim.api.nvim_win_is_valid(reader_win) and not vim.api.nvim_win_is_valid(parent_win))
+        assert(#vim.api.nvim_list_wins() == 1)
+    ]])
+end
+
+T["thread bindings can be disabled in source, reader and composer"] = function()
+    child.lua([[
+        workspace.stop()
+        local disabled = { resolve = false, reopen = false, delete = false }
+        require('parley').setup({ keymaps = { review = disabled, discussion = disabled, composer = disabled } })
+        assert(workspace.activate(binding))
+        function assert_no_thread_keys(buffer)
+            vim.api.nvim_buf_call(buffer, function()
+                for _, key in ipairs({ '\\tr', '\\tR', '\\td' }) do
+                    assert(vim.fn.maparg(key, 'n') == '')
+                end
+            end)
+        end
+        assert_no_thread_keys(source_buf)
+        a = assert(workspace.add_conversation({ id = 'disabled', lines = { 'Draft' } }, 1, 1))
+        workspace.edit_note()
+        assert_no_thread_keys(a.note.buffer)
+        assert(conversation.receive(a, { id = 'agent', role = 'agent', author = 'Agent', origin = 'pi', created_at = 1, lines = { 'Answer' } }))
+    ]])
+    child.type_keys("<C-c>")
+    child.lua([[
+        workspace.edit_note()
+        assert_no_thread_keys(vim.api.nvim_get_current_buf())
+        assert(not a.deleted and not a.resolved)
+    ]])
+end
+
+T["deletion clears cards in every source window and survives later refreshes"] = function()
+    child.lua([[
+        a = assert(workspace.add_conversation({ id = 'multi-window', lines = { 'Unique deleted prose' } }, 1, 1))
+        b = assert(workspace.add_conversation({ id = 'kept', lines = { 'Unique retained prose' } }, 2, 2))
+        vim.cmd.vsplit()
+        second_win = vim.api.nvim_get_current_win()
+        workspace.edit_note()
+    ]])
+    child.type_keys("<Esc>", "<C-c>")
+    child.lua([[
+        assert(conversation.active() == a)
+        local function card_text()
+            local chunks = {}
+            for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(source_buf, -1, 0, -1, { details = true })) do
+                for _, line in ipairs(mark[4].virt_lines or {}) do
+                    for _, chunk in ipairs(line) do chunks[#chunks + 1] = chunk[1] end
+                end
+            end
+            return table.concat(chunks, '\n')
+        end
+        assert(card_text():find('Unique deleted prose', 1, true))
+        vim.ui.select = function(_, _, callback) callback('Delete') end
+        workspace.delete_note()
+        assert(a.deleted and not card_text():find('Unique deleted prose', 1, true))
+        assert(card_text():find('Unique retained prose', 1, true))
+        vim.api.nvim_set_current_win(source_win)
+        vim.api.nvim_exec_autocmds('WinResized', {})
+        local refreshed = false
+        vim.schedule(function() refreshed = true end)
+        assert(vim.wait(1000, function() return refreshed end))
+        assert(not card_text():find('Unique deleted prose', 1, true))
+        workspace.move_note(1)
+        assert(conversation.active() == b)
+        vim.api.nvim_set_current_win(second_win)
+        vim.api.nvim_win_set_cursor(second_win, { 1, 0 })
+        assert(not conversation.active())
+    ]])
+end
+
+T["source changes invalidate selection before a scheduled card refresh or confirmation"] = function()
+    child.lua([[
+        a = assert(workspace.add_conversation({ id = 'stale-source', lines = { 'Keep draft' } }, 1, 1))
+        workspace.edit_note()
+    ]])
+    child.type_keys("<Esc>", "<C-c>")
+    child.lua([[
+        vim.ui.select = function(_, _, callback) confirmation = callback end
+        workspace.delete_note()
+        assert(confirmation)
+        vim.api.nvim_buf_set_lines(source_buf, 0, 1, false, { 'Changed source' })
+        confirmation('Delete')
+        assert(not a.deleted)
+        workspace.resolve_note(true)
+        assert(not a.resolved)
+    ]])
+end
+
+T["default thread bindings show composer hints and allow deletion from the parent reader"] = function()
+    child.lua([[
+        a = assert(workspace.add_conversation({ id = 'defaults', lines = { 'Draft' } }, 1, 1))
+        workspace.edit_note()
+        local bindings = {}
+        for _, action in ipairs({ 'resolve', 'reopen', 'delete' }) do
+            local key = require('parley.config').get().composer[action][1]
+            key = require('parley.composer.keymaps').concrete(key)
+            local mapping = vim.fn.maparg(key, 'n', false, true)
+            assert(mapping.callback, action .. ' must be bound')
+            bindings[#bindings + 1] = { name = action, mode = 'n', key = key,
+                action = mapping.callback, description = mapping.desc }
+        end
+        local help = require('parley.composer.help')
+        help.toggle()
+        local row = assert(help.row(a.note.buffer, bindings, 'n', 500))
+        local labels = {}
+        for _, chunk in ipairs(row) do labels[#labels + 1] = chunk[1] end
+        local text = table.concat(labels)
+        assert(text:find('resolve', 1, true) and text:find('reopen', 1, true) and text:find('delete', 1, true), text)
+        for _, chunk in ipairs(help.row(a.note.buffer, bindings, 'i', 500) or {}) do
+            assert(not chunk[1]:find('resolve', 1, true) and not chunk[1]:find('reopen', 1, true) and not chunk[1]:find('delete', 1, true))
+        end
+        local request = capture('default-request', 'ask')
+        accept(request)
+        assert(workspace.import_results(request, {}))
+        assert(conversation.receive(a, { id = 'agent-default', parent_id = a.thread.messages[1].id, role = 'agent', author = 'Agent', origin = 'pi', created_at = 2, lines = { 'Answer' } }))
+    ]])
+    child.type_keys("<Esc>", "<C-c>")
+    child.lua([[
+        workspace.edit_note()
+        local reader = vim.api.nvim_get_current_win()
+        for _, window in ipairs(vim.api.nvim_list_wins()) do
+            if window ~= source_win and window ~= reader then vim.api.nvim_set_current_win(window) break end
+        end
+        assert(conversation.active() == a)
+        vim.ui.select = function(_, _, callback) callback('Delete') end
+    ]])
+    child.type_keys("\\td")
+    child.lua([[
+        assert(a.deleted and #a.thread.messages == 2)
+        assert(vim.api.nvim_get_current_win() == source_win and #vim.api.nvim_list_wins() == 1)
     ]])
 end
 
